@@ -6,6 +6,9 @@ mod feed;
 mod http;
 mod integrity;
 pub(crate) mod inventory;
+mod nested;
+pub(crate) use feed::inspect_page;
+pub(crate) use nested::verify_inspection;
 
 use crate::{AppState, SourceInput};
 use adapter::{Artifact, Catalog, ManifestAdapter, Mapping};

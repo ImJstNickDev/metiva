@@ -21,9 +21,18 @@ use sqlx::Row;
 use std::collections::{HashSet, VecDeque};
 use url::Url;
 
+const NEXT_FIELDS: &[&str] = &[
+    "/next",
+    "/next_url",
+    "/next_page",
+    "/pagination/next",
+    "/pagination/next_url",
+    "/pagination/next_page",
+    "/links/next",
+];
 const PAGE_BYTES: usize = 8 << 20;
-const SOURCE_BYTES: usize = 32 << 20;
-const MAX_PAGES: usize = 128;
+pub(super) const SOURCE_BYTES: usize = 32 << 20;
+pub(super) const MAX_PAGES: usize = 128;
 
 pub(crate) struct Source {
     pub id: i64,
@@ -320,6 +329,95 @@ impl Chain {
         Ok(())
     }
 }
+// Nested rules describe one complete inventory. Accepting the first page as
+// the whole release set would silently narrow the scope of a saved recipe.
+fn terminal_next(value: &Value) -> bool {
+    value.is_null() || value == false || value.as_str() == Some("")
+}
+pub(super) fn check_nested_root(
+    wrapper: Option<&Value>,
+    link: Option<&str>,
+    rows: usize,
+) -> Result<()> {
+    let message = "nested release collections require a complete, unpaginated root document";
+    if let Some(link) = link {
+        ensure!(next_link(link)?.is_none(), "{message} (HTTP next link)");
+    }
+    let Some(doc) = wrapper else {
+        return Ok(());
+    };
+    for path in NEXT_FIELDS {
+        if let Some(value) = doc.pointer(path) {
+            ensure!(terminal_next(value), "{message} ({path})");
+        }
+    }
+    let pagination = doc
+        .get("pagination")
+        .filter(|v| v.is_object())
+        .unwrap_or(doc);
+    for field in ["page", "pages", "total_pages"] {
+        if let Some(n) = selection::number(pagination, field)? {
+            ensure!(n == 1, "{message} ({field})");
+        }
+    }
+    for field in ["count", "total_count", "total_items"] {
+        if let Some(n) = selection::number(pagination, field)? {
+            ensure!(n == rows as u64, "{message} ({field})");
+        }
+    }
+    Chain::default()
+        .advance(doc, None, Some(rows as u64))
+        .context(message)?;
+    Ok(())
+}
+
+pub(super) fn check_nested_child(doc: &Value, link: Option<&str>) -> Result<()> {
+    let message = "linked manifest advertises pagination and does not describe a complete document";
+    if let Some(link) = link {
+        ensure!(next_link(link)?.is_none(), "{message} (HTTP next link)");
+    }
+    for path in ["/links/next", "/_links/next"] {
+        if let Some(value) = doc.pointer(path) {
+            ensure!(terminal_next(value), "{message} ({path})");
+        }
+    }
+    for path in [
+        "/pagination/has_more",
+        "/pagination/hasMore",
+        "/pagination/has_next",
+        "/pagination/hasNextPage",
+        "/pageInfo/hasNextPage",
+        "/has_more",
+        "/hasMore",
+        "/has_next",
+    ] {
+        ensure!(
+            doc.pointer(path).and_then(Value::as_bool) != Some(true),
+            "{message} ({path})"
+        );
+    }
+    let pagination = doc.get("pagination").filter(|v| v.is_object()).or_else(|| {
+        (doc.get("page").is_some_and(Value::is_number)
+            && ["pages", "total_pages"]
+                .iter()
+                .any(|key| doc.get(*key).is_some_and(Value::is_number)))
+        .then_some(doc)
+    });
+    if let Some(envelope) = pagination {
+        for key in ["next", "next_url", "next_page"] {
+            if let Some(value) = envelope.get(key) {
+                ensure!(terminal_next(value), "{message} ({key})");
+            }
+        }
+        for key in ["page", "pages", "total_pages"] {
+            if let Some(n) = selection::number(envelope, key)? {
+                ensure!(n <= 1, "{message} ({key})");
+            }
+        }
+    }
+    Ok(())
+}
+
 struct Target {
     url: Option<Url>,
     chain: Chain,
@@ -398,28 +496,20 @@ impl Walk {
                     )?);
                 }
             }
-            [
-                "/next",
-                "/next_url",
-                "/next_page",
-                "/pagination/next",
-                "/pagination/next_url",
-                "/pagination/next_page",
-                "/links/next",
-            ]
-            .iter()
-            .filter_map(|p| doc.pointer(p))
-            .find(|v| !v.is_null())
-            .map(|v| {
-                adapter::parse_url(
-                    v.as_str()
-                        .or_else(|| v.get("href")?.as_str())
-                        .filter(|s| !s.trim().is_empty())
-                        .context("next page must be a URL")?,
-                    base,
-                )
-            })
-            .transpose()?
+            NEXT_FIELDS
+                .iter()
+                .filter_map(|p| doc.pointer(p))
+                .find(|v| !v.is_null())
+                .map(|v| {
+                    adapter::parse_url(
+                        v.as_str()
+                            .or_else(|| v.get("href")?.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                            .context("next page must be a URL")?,
+                        base,
+                    )
+                })
+                .transpose()?
         } else {
             adapter::GenericJson.parse_page(&page.bytes, mapping, base, &mut local)?
         };
@@ -495,6 +585,30 @@ async fn read(
         link: None,
     })
 }
+pub(crate) async fn inspect_page(
+    state: &AppState,
+    url: Option<&Url>,
+    upload: Option<&str>,
+) -> Result<(Vec<u8>, Option<Url>)> {
+    ensure!(
+        url.is_some() != upload.is_some(),
+        "supply one URL or upload"
+    );
+    if let Some(url) = url {
+        let page = remote(state, 0, url, false, 0, None).await?;
+        return Ok((page.bytes, page.url));
+    }
+    let body = upload.context("missing uploaded document")?;
+    ensure!(
+        body.len() <= PAGE_BYTES,
+        "uploaded source exceeds byte limit"
+    );
+    Ok((body.as_bytes().to_vec(), None))
+}
+
+#[path = "nested_io.rs"]
+mod nested_io;
+
 pub(super) async fn discover(
     state: &AppState,
     url: Option<&str>,
@@ -537,6 +651,12 @@ pub(crate) async fn collect(
     } else {
         0
     };
+    if let Some(rule) = &source.mapping.nested {
+        let (local, observations) =
+            nested_io::collect(state, source, rule, job, conditional, retries, limits).await?;
+        adapter::merge(catalog, local)?;
+        return Ok(observations);
+    }
     let mut walk = Walk::new(source.url.clone(), job.is_none());
     let mut observations = Vec::new();
     while let Some(target) = walk.take()? {
@@ -637,6 +757,11 @@ pub(crate) async fn restore(
     // observation IDs and the response headers captured alongside their bytes.
     for source in sources {
         source.mapping.validate()?;
+        if let Some(rule) = &source.mapping.nested {
+            let nested = nested_io::restore(state, source, rule, job, ids, &mut catalog).await?;
+            observations.extend(nested);
+            continue;
+        }
         let mut walk = Walk::new(source.url.clone(), false);
         let mut pages = sqlx::query("SELECT o.id,o.digest,o.url,o.request_url,o.next_link,d.body FROM json_each(?) j JOIN source_observations o ON o.id=j.value JOIN raw_documents d USING(digest) WHERE o.job_id=? AND o.source_id=? ORDER BY j.key")
             .bind(ids).bind(job).bind(source.id).fetch(&state.db);

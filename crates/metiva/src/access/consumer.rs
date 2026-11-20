@@ -381,6 +381,7 @@ pub fn openapi() -> Value {
             ),
         ]),
     );
+    schemas["Artifact"]["properties"]["logical_path"] = json!({"type":"string","description":"Original logical name when the mirror uses an encoded filename"});
     schemas.insert(
         "Release".into(),
         object(&[

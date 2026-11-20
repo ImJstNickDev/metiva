@@ -1,3 +1,4 @@
+mod nesting;
 mod parking;
 mod timeline;
 
@@ -40,6 +41,10 @@ pub fn router() -> Router<AppState> {
             get(runtime).patch(update_runtime),
         )
         .route("/api/admin/runtimes/{id}/past-files", get(past_files))
+        .route(
+            "/api/admin/runtimes/{id}/inspect-document",
+            post(nesting::inspect),
+        )
         .route("/api/admin/runtimes/{id}/preview", post(preview))
         .route("/api/admin/runtimes/{id}/sources", post(add_source))
         .route(

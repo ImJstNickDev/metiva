@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use url::Url;
 
-const MAX_ITEMS: usize = 100_000;
+pub(super) const MAX_ITEMS: usize = 100_000;
 const RELEASES: &[&str] = &["releases", "versions", "items", "data"];
 pub(super) const VERSION: &[&str] = &["version", "tag_name", "release", "name", "id"];
 const ASSETS: &[&str] = &["artifacts", "assets", "files", "downloads", "platforms"];
@@ -32,10 +32,15 @@ pub(crate) struct Mapping {
     sha256_path: Option<String>,
     pub next_path: Option<String>,
     pub selection: Option<super::selection::Selection>,
+    pub nested: Option<super::nested::Nested>,
 }
 impl Mapping {
     pub(super) fn validate(&self) -> Result<()> {
-        if let Some(rule) = &self.selection {
+        if self.selection.is_some() || self.nested.is_some() {
+            ensure!(
+                self.selection.is_none() || self.nested.is_none(),
+                "choose a single mapping mode"
+            );
             ensure!(
                 [
                     &self.releases_path,
@@ -51,6 +56,11 @@ impl Mapping {
                 .all(Option::is_none),
                 "choose a guided selection or a manual mapping"
             );
+        }
+        if let Some(rule) = &self.selection {
+            rule.validate()?;
+        }
+        if let Some(rule) = &self.nested {
             rule.validate()?;
         }
         Ok(())
@@ -72,7 +82,7 @@ pub(crate) struct Catalog {
     pub versions: BTreeMap<String, Map<String, Value>>,
 }
 impl Catalog {
-    fn check_limits(&self) -> Result<()> {
+    pub(super) fn check_limits(&self) -> Result<()> {
         ensure!(
             self.versions.len() + self.release_errors.len() <= MAX_ITEMS
                 && self.assets.len() <= MAX_ITEMS,
@@ -157,13 +167,17 @@ fn merge_fields(dest: &mut Map<String, Value>, other: &Map<String, Value>) -> Re
     }
     Ok(())
 }
-fn add_version(out: &mut Catalog, version: &str, meta: &Map<String, Value>) -> Result<()> {
+pub(super) fn add_version(
+    out: &mut Catalog,
+    version: &str,
+    meta: &Map<String, Value>,
+) -> Result<()> {
     merge_fields(out.versions.entry(version.into()).or_default(), meta)
         .with_context(|| format!("release {version}"))?;
     ensure!(out.versions.len() <= MAX_ITEMS, "too many releases");
     Ok(())
 }
-fn insert(out: &mut Catalog, id: (String, String), item: Artifact) -> Result<()> {
+pub(super) fn insert(out: &mut Catalog, id: (String, String), item: Artifact) -> Result<()> {
     use std::collections::btree_map::Entry;
     match out.assets.entry(id) {
         Entry::Vacant(e) => {
@@ -220,7 +234,11 @@ pub(crate) fn merge(out: &mut Catalog, page: Catalog) -> Result<()> {
     out.check_limits()
 }
 
-fn add_hash(hashes: &mut BTreeMap<String, String>, algorithm: &str, digest: &str) -> Result<()> {
+pub(super) fn add_hash(
+    hashes: &mut BTreeMap<String, String>,
+    algorithm: &str,
+    digest: &str,
+) -> Result<()> {
     let name = algorithm.to_ascii_lowercase().replace('-', "");
     let length = match name.as_str() {
         "md5" => 32,
@@ -240,7 +258,11 @@ fn add_hash(hashes: &mut BTreeMap<String, String>, algorithm: &str, digest: &str
     }
     Ok(())
 }
-fn hashes(v: &Value, m: &Mapping) -> Result<BTreeMap<String, String>> {
+pub(super) fn descriptor_hashes(
+    v: &Value,
+    m: &Mapping,
+    custom: Option<(&str, &str)>,
+) -> Result<BTreeMap<String, String>> {
     let mut hashes = BTreeMap::new();
     for alg in ["sha256", "sha384", "sha512", "sha1", "md5"] {
         if let Some(hash) = v.get(alg).filter(|x| !x.is_null()) {
@@ -261,6 +283,11 @@ fn hashes(v: &Value, m: &Mapping) -> Result<BTreeMap<String, String>> {
             Some(Value::String(s)) => {
                 let (alg, h) = s
                     .split_once(':')
+                    .or_else(|| {
+                        custom
+                            .filter(|(path, _)| path.strip_prefix('/') == Some(key))
+                            .map(|(_, alg)| (alg, s.as_str()))
+                    })
                     .or_else(|| (s.len() == 64).then_some(("sha256", s.as_str())))
                     .context("checksum requires an algorithm")?;
                 add_hash(&mut hashes, alg, h)?;
@@ -330,7 +357,7 @@ impl Scan<'_> {
                         .context("invalid artifact size")
                 })
                 .transpose()?;
-            let hashes = hashes(item, m)?;
+            let hashes = descriptor_hashes(item, m, None)?;
             let mut metadata = item.as_object().cloned().unwrap_or_default();
             for k in URLS.iter().chain(NAMES).chain(SIZES).chain(
                 [
@@ -597,7 +624,7 @@ pub(crate) fn releases(catalog: &Catalog) -> Value {
         .collect();
     for ((version, filename), a) in &catalog.assets {
         let mut v = json!({"filename":filename,"url":a.url,"size":a.size,"sha256":a.sha256});
-        for k in ["platform", "os", "arch", "architecture"] {
+        for k in ["platform", "os", "arch", "architecture", "logical_path"] {
             if let Some(value) = a.metadata.get(k) {
                 v[k] = value.clone();
             }
@@ -645,7 +672,7 @@ pub(crate) fn rewrite(
     mirrored: &Catalog,
 ) -> Option<Value> {
     let mut root: Value = serde_json::from_slice(bytes).ok()?;
-    if m.selection.is_some() || signature(&root) {
+    if m.selection.is_some() || m.nested.is_some() || signature(&root) {
         return None;
     }
     let doc = scan(&root, m, base).ok()?;
