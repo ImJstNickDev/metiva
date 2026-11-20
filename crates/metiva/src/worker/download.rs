@@ -328,7 +328,7 @@ impl Transfer {
     pub async fn run(&self, state: &AppState) -> Result<Option<(String, u64)>> {
         loop {
             let row = sqlx::query(
-                "SELECT state,command,retries,retry_at,digest FROM transfers WHERE id=?",
+                "SELECT state,command,retries,retry_at,digest,error FROM transfers WHERE id=?",
             )
             .bind(self.id)
             .fetch_one(&state.db)
@@ -338,6 +338,14 @@ impl Transfer {
             if cmd.as_deref() == Some("cancel") || status == "cancelled" {
                 sqlx::query("UPDATE transfers SET state='cancelled',speed=0,command=NULL,retry_at=NULL WHERE id=?").bind(self.id).execute(&state.db).await?;
                 anyhow::bail!("transfer cancelled");
+            }
+            if status == "failed" {
+                anyhow::bail!(
+                    "{}",
+                    row.get::<Option<String>, _>("error")
+                        .as_deref()
+                        .unwrap_or("transfer failed")
+                );
             }
             if cmd.as_deref() == Some("pause") {
                 sqlx::query("UPDATE transfers SET state='paused',speed=0,command=NULL WHERE id=? AND command='pause'").bind(self.id).execute(&state.db).await?;
