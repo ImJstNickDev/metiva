@@ -1,5 +1,5 @@
 x-service: &service
-  image: metiva-service:${METIVA_IMAGE_TAG:-local}
+  image: ${METIVA_SERVICE_IMAGE:-metiva-service}:${METIVA_IMAGE_TAG:-local}
   user: "${METIVA_UID:-1000}:${METIVA_GID:-1000}"
   environment:
     METIVA_PUBLIC_URL: ${METIVA_PUBLIC_URL:?Set the public HTTPS origin in .env}
@@ -44,7 +44,7 @@ services:
 
   metiva:
     container_name: metiva
-    image: metiva-ingress:${METIVA_IMAGE_TAG:-local}
+    image: ${METIVA_INGRESS_IMAGE:-metiva-ingress}:${METIVA_IMAGE_TAG:-local}
     build:
       context: .
       target: ingress
