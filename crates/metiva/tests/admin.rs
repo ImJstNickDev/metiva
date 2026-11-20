@@ -383,11 +383,26 @@ async fn parking_cancels_work_and_restores_only_explicit_targets() {
         200,
     )
     .await;
-    d.call(Method::POST, &format!("{rt}/sync"), None, 200).await;
+    let job = d.call(Method::POST, &format!("{rt}/sync"), None, 200).await["id"]
+        .as_i64()
+        .unwrap();
+    let transfer = sqlx::query("INSERT INTO transfers(job_id,runtime_id,filename,host,backend,state,command) VALUES(?,?,'bundle.bin','example.org','native','downloading','pause')")
+        .bind(job).bind(runtime).execute(&d.state.db).await.unwrap().last_insert_rowid();
     d.call(Method::POST, &format!("{rt}/park"), None, 200).await;
     d.call(Method::POST, &format!("{rt}/sync"), None, 409).await;
     let view = d.call(Method::GET, &rt, None, 200).await;
     assert_eq!(view["history"][0]["state"], "cancelled");
+    assert_eq!(
+        d.call(Method::GET, "transfers", None, 200).await[0]["state"],
+        "cancelled"
+    );
+    d.call(
+        Method::POST,
+        &format!("transfers/{transfer}/retry"),
+        None,
+        409,
+    )
+    .await;
     assert!(view["parked_at"].is_number());
     assert_eq!(
         d.call(Method::GET, "overview", None, 200).await["runtimes"],
@@ -416,7 +431,13 @@ async fn parking_cancels_work_and_restores_only_explicit_targets() {
     d.call(Method::POST, &format!("{rt}/restore"), None, 200)
         .await;
     assert_eq!(d.call(Method::GET, "archive", None, 200).await, json!([]));
-    d.call(Method::POST, &format!("{rt}/sync"), None, 200).await;
+    d.call(
+        Method::POST,
+        &format!("transfers/{transfer}/retry"),
+        None,
+        200,
+    )
+    .await;
     d.call(Method::POST, &format!("{p}/park"), None, 200).await;
     assert!(d.call(Method::GET, &rt, None, 200).await["project_parked_at"].is_number());
     d.call(Method::POST, &format!("{p}/restore"), None, 200)

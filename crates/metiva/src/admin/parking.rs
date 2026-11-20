@@ -78,7 +78,7 @@ async fn change(s: AppState, target: Target, id: i64, park: bool) -> ResultJson 
             .await?,
     );
     if park {
-        sqlx::query("UPDATE transfers SET state='cancelled',command='cancel',speed=0,retry_at=NULL,error='Mirror parked'
+        sqlx::query("UPDATE transfers SET state='cancelled',command=NULL,speed=0,retry_at=NULL,error='Mirror parked'
                      WHERE state NOT IN ('completed','cancelled','failed') AND runtime_id NOT IN (SELECT id FROM available_runtimes)")
             .execute(&mut *tx).await?;
         sqlx::query("UPDATE jobs SET state='cancelled',finished_at=unixepoch(),error='Mirror parked'
