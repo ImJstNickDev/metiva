@@ -47,7 +47,7 @@ For registry deployment, set these variables in `.env` along with the public ori
 ```dotenv
 METIVA_INGRESS_IMAGE=ghcr.io/imjstnickdev/metiva
 METIVA_SERVICE_IMAGE=ghcr.io/imjstnickdev/metiva-service
-METIVA_IMAGE_TAG=v0.1.2
+METIVA_IMAGE_TAG=v0.1.3
 ```
 
 To pull from Docker Hub, set `METIVA_INGRESS_IMAGE=docker.io/imjstnick/metiva` and `METIVA_SERVICE_IMAGE=docker.io/imjstnick/metiva-service` with the same tag.
@@ -63,5 +63,5 @@ A published GitHub release builds the ingress and service images on GHCR. To als
 To copy an already published tag after enabling Docker Hub, use the **Versioned images** workflow on the default branch.
 
 ```sh
-gh workflow run images.yml -f tag=v0.1.2
+gh workflow run images.yml -f tag=v0.1.3
 ```

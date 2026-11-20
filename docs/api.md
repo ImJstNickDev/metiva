@@ -57,7 +57,7 @@ To withdraw a runtime, park it. Restore it to resume serving the same URLs with 
 
 ## Nested documents
 
-Under **Import source**, inspect a document, choose its release collection, then inspect one matching record. Filter by a scalar field such as a channel or ID and set how many matching records to follow. Arrays use upstream order and keyed collections use lexicographic key order. In the sample, choose a reference to mirror as a file or open it as a document and select its children. A JSON file can serve either role.
+Under **Import source**, inspect a document, choose its release collection, then inspect one matching record. Filter by a scalar field such as a channel or ID. Leave the sync limit blank for all matches, or set a maximum after filtering. An explicit limit in an existing source stays in effect after upgrading. Arrays use upstream order and keyed collections use lexicographic key order. In the sample, choose a reference to mirror as a file or open it as a document and select its children. A JSON file can serve either role.
 
 A nested source stores these choices in `mapping.nested`. For example, the following selection follows the descriptor of each matching release, mirrors the portable package, and follows a second document containing content-addressed resources.
 
@@ -89,4 +89,8 @@ Set `required` to `false` to allow an absent branch in layouts that vary by rele
 
 The nested release collection must fit in one root document. An advertised next page or incomplete page count stops the sync before any child requests. A linked document that advertises additional pages through an HTTP Link header or pagination metadata holds back its release. For paginated release lists, use the release-list picker or a manual pagination mapping.
 
-The nested walker allows eight rule levels, 128 distinct document requests including the root, 8 MiB per document and 32 MiB of document bytes per source per sync. Preview uses the same limits. A filter and a release limit apply before Metiva requests child documents. A budget error leaves the previous working publication available.
+Preview counts the selected root records and opens at most five of them. Its file counts and sizes describe the sample. The saved mapping applies to the entire selection, including records outside the preview. Already published files stay available when a version moves outside an explicit limit.
+
+A nested sync holds the root inventory fixed and traverses releases in order. Each release can use up to 128 documents including the root, up to 32 MiB of document bytes, and eight rule levels. Each document must fit within 8 MiB. The preview shares a single 128-document, 32 MiB budget across its sample. The worker retains original documents on disk so a restart can resume the same job with the root and children already observed, even if the upstream changes during the interruption.
+
+A source can select up to 100,000 records and resolve up to 100,000 file references per run. A synchronization also caps discovery at 100,000 distinct document requests and 4 GiB of document bytes per nested source. These safeguards apply to manifest processing. Artifact bodies stream through the download manager with their own size limits.
