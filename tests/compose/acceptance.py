@@ -10,7 +10,6 @@ import ssl
 import sys
 import time
 
-
 ROOT = Path("/fixture")
 ORIGIN = "http://93.184.216.34:8081"
 SESSION = ROOT / ".test-session"
@@ -353,14 +352,56 @@ elif sys.argv[1] == "mirror":
     )
     manifest(["beta.bin"])
     sync()
-    request(alpha, key=state["key"], status=(404,))
-    archives = admin("archive")
+    assert {f["filename"] for f in runtime_view()["current_files"]} == {
+        "alpha.bin",
+        "beta.bin",
+        "gamma.bin",
+    }
+    assert admin("archive") == []
     old = next(
-        f for pub in archives for f in pub["files"] if f["filename"] == "alpha.bin"
+        f for f in runtime_view()["current_files"] if f["filename"] == "alpha.bin"
     )
-    archived = request(f"/api/admin/archive/files/{old['id']}", admin=True, raw=True)
-    assert hashlib.sha256(archived).hexdigest() == old["digest"]
+    assert (
+        hashlib.sha256(request(alpha, key=state["key"], raw=True)).hexdigest()
+        == old["digest"]
+    )
     request("/_objects/" + old["digest"], status=(404,), raw=True)
+    beta = base + "/files/winter-01/beta.bin"
+    previous_bytes = request(beta, key=state["key"], raw=True)
+    replacement = b"Corrected portable package"
+    (ROOT / "beta.bin").write_bytes(replacement)
+    manifest(["beta.bin"])
+    sync()
+    assert request(beta, key=state["key"], raw=True) == replacement
+    file = next(
+        f for f in runtime_view()["current_files"] if f["filename"] == "beta.bin"
+    )
+    revisions = admin(f"files/{file['id']}/history")["revisions"]
+    assert [r["current"] for r in revisions] == [True, False], revisions
+    assert request(revisions[1]["download_url"], admin=True, raw=True) == previous_bytes
+    request(revisions[1]["download_url"], key=glob["token"], status=(401,))
+    # Parking cuts off new requests immediately for every credential scope.
+    proj = f"projects/{state['project']}"
+    arm = next(r for r in admin(proj + "/runtimes") if r["slug"] == "arm")
+    admin(f"runtimes/{arm['id']}/park", "POST", {})
+    admin(proj + "/park", "POST", {})
+    assert not any(
+        p["slug"] == "atlas" for p in request("/api/v1/projects", key=glob["token"])
+    )
+    for token in (state["key"], project["token"], glob["token"]):
+        request(published, key=token, status=(404,))
+        request(beta, key=token, headers={"Range": "bytes=0-1"}, status=(404,))
+    assert request(revisions[1]["download_url"], admin=True, raw=True) == previous_bytes
+    admin(proj + "/restore", "POST", {})
+    assert request(beta, key=state["key"], raw=True) == replacement
+    request(
+        "/api/v1/projects/atlas/runtimes/arm/availability",
+        key=glob["token"],
+        status=(404,),
+    )
+    assert [(row["kind"], row["id"]) for row in admin("archive")] == [
+        ("runtime", arm["id"])
+    ]
     # Paginated and uploaded sources retain independent provenance after merging.
     combined = admin(
         f"projects/{state['project']}/runtimes",
@@ -389,6 +430,88 @@ elif sys.argv[1] == "mirror":
         admin(f"runtimes/{combined}")["active_publication"]
         == combined_view["active_publication"]
     )
+    # Discover an index and select one of two branches and one of two targets.
+    guided = admin(proj + "/runtimes", "POST", {"slug": "guided", "name": "Guided"})[
+        "id"
+    ]
+    guide = f"runtimes/{guided}"
+
+    def entry(version):
+        return {
+            "version": version,
+            "packages": {
+                "portable": {"url": ORIGIN + "/beta.bin"},
+                "desktop": {"url": ORIGIN + "/alpha.bin"},
+            },
+        }
+
+    root = {
+        "streams": {
+            "early": {"first_page": "/first.json", "count": 1, "pages": 1},
+            "daily": {"first_page": "/second.json", "count": 1, "pages": 1},
+        }
+    }
+    (ROOT / "index.json").write_text(json.dumps(root))
+    (ROOT / "first.json").write_text(json.dumps({"versions": [entry("early-01")]}))
+    (ROOT / "second.json").write_text(json.dumps({"versions": [entry("daily-01")]}))
+    src = {"url": ORIGIN + "/index.json"}
+    discovered = admin(guide + "/discover", "POST", src)
+    index = next(i for i in discovered["indexes"] if i["path"] == "/streams")
+    index = {**index, "keys": ["daily"]}
+    collections = admin(guide + "/discover", "POST", {**src, "index": index})[
+        "collections"
+    ]
+    collection = next(c for c in collections if c["path"] == "/versions")
+    assert (
+        "portable"
+        in next(g for g in collection["groups"] if g["path"] == "/packages")["keys"]
+    )
+    select = {
+        "index": index,
+        "path": collection["path"],
+        "version_path": collection["version_path"],
+        "groups": [{"path": "/packages", "keys": ["portable"]}],
+    }
+    source = {**src, "mapping": {"selection": select}}
+    preview = admin(guide + "/preview", "POST", source)
+    assert [r["version"] for r in preview["releases"]] == ["daily-01"]
+    admin(guide + "/sources", "POST", source)
+    sync(runtime=guided)
+    assert [f["filename"] for f in admin(guide)["current_files"]] == ["beta.bin"]
+    (ROOT / "second.json").write_text(json.dumps({"versions": [entry("daily-02")]}))
+    sync(runtime=guided)
+    assert {f["release"] for f in admin(guide)["current_files"]} == {
+        "daily-01",
+        "daily-02",
+    }
+    # A newly advertised channel is opt-in. If a selected channel disappears
+    # entirely, its existing files stay available until the mirror is parked.
+    root["streams"]["next"] = root["streams"].pop("daily")
+    (ROOT / "index.json").write_text(json.dumps(root))
+    sync(runtime=guided)
+    assert {f["release"] for f in admin(guide)["current_files"]} == {
+        "daily-01",
+        "daily-02",
+    }
+    root["streams"]["daily"] = root["streams"].pop("next")
+    root["streams"]["daily"]["count"] = 2
+    (ROOT / "index.json").write_text(json.dumps(root))
+    rejected = entry("daily-bad")
+    rejected["packages"]["portable"]["sha256"] = "0" * 64
+    (ROOT / "second.json").write_text(
+        json.dumps({"versions": [entry("daily-03"), rejected]})
+    )
+    sync("failed", runtime=guided)
+    view = admin(guide)
+    assert {f["release"] for f in view["current_files"]} == {
+        "daily-01",
+        "daily-02",
+        "daily-03",
+    }
+    assert (
+        view["history"][0]["verified_releases"],
+        view["history"][0]["failed_releases"],
+    ) == (1, 1)
     save()
 elif sys.argv[1] == "controls":
     transfer_controls()
@@ -401,5 +524,5 @@ elif sys.argv[1] == "restart":
             return False
 
     wait(healthy, "deployment failed to recover")
-    assert len(request(published, key=state["key"])["releases"][0]["artifacts"]) == 1
+    assert len(request(published, key=state["key"])["releases"][0]["artifacts"]) == 3
     assert admin("archive")
