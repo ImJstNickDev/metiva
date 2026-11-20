@@ -64,6 +64,9 @@ services:
       timeout: 4s
 
 networks:
-  backend: {}
+  backend:
+    ipam:
+      config:
+        - subnet: ${METIVA_BACKEND_SUBNET:-10.243.62.0/28}
   prod-frontend:
     external: true
