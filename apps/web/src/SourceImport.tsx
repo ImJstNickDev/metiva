@@ -7,9 +7,9 @@ import {
   type ArchiveFile,
   type Discovery,
   type DocumentInspection,
-  type Manifest,
   type Source,
   type SourceMapping,
+  type SourcePreview,
 } from "./model";
 import { SourcePicker, type SourceInput } from "./SourcePicker";
 import { DocumentPicker } from "./DocumentPicker";
@@ -26,7 +26,7 @@ const fields = [
   ["next_path", "Next page URL", "/next"],
 ] as const;
 type Input = SourceInput & { mapping?: SourceMapping };
-type Review = { input: Input; manifest: Manifest };
+type Review = { input: Input; manifest: SourcePreview };
 
 export function ImportSource({
   id,
@@ -73,7 +73,7 @@ export function ImportSource({
   const [review, setReview] = useState<Review | null>(null);
   const notice = useNotice();
   async function preview(input: Input) {
-    const manifest = await api<Manifest>(
+    const manifest = await api<SourcePreview>(
       `runtimes/${id}/preview`,
       "POST",
       input,
@@ -157,7 +157,9 @@ export function ImportSource({
       }
       desc={
         review
-          ? "Review the files included by this source before saving."
+          ? review.manifest.selection
+            ? "Review the sync scope and sampled files before saving."
+            : "Review the files included by this source before saving."
           : inspected
             ? inspected.input.url || "Uploaded JSON manifest"
             : "Import an upstream manifest from a URL or a JSON file."
@@ -341,7 +343,7 @@ export function ManifestView({
   files,
   onInspect,
 }: {
-  manifest: Manifest;
+  manifest: SourcePreview;
   review?: boolean;
   files?: ArchiveFile[];
   onInspect?: (file: ArchiveFile) => void;
@@ -349,6 +351,8 @@ export function ManifestView({
   const [shown, setShown] = useState(25);
   const [fileLimits, setFileLimits] = useState(new Map<string, number>());
   const releases = manifest.releases;
+  const selection = review ? manifest.selection : undefined;
+  const warnings = review ? manifest.warnings : undefined;
   const published = new Map(
     files?.map((f) => [JSON.stringify([f.release, f.filename]), f]),
   );
@@ -357,10 +361,35 @@ export function ManifestView({
   const total = artifacts.reduce((sum, a) => sum + (a.size ?? 0), 0);
   return (
     <div className="manifest-list">
+      {selection && (
+        <p className="preview-scope">
+          <strong>{selection.matched.toLocaleString()}</strong>{" "}
+          {selection.matched === 1 ? "release" : "releases"} selected for sync.{" "}
+          Preview checked {selection.previewed.toLocaleString()}{" "}
+          {selection.previewed === 1 ? "release" : "releases"}.
+        </p>
+      )}
+      {!!warnings?.length && (
+        <div className="preview-warnings">
+          <strong>
+            {warnings.length} sampled{" "}
+            {warnings.length === 1 ? "release" : "releases"} had preview issues
+          </strong>
+          <ul>
+            {warnings.map(({ version, error }, i) => (
+              <li key={i}>
+                <strong>{version}</strong> · {error}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       <div className="inventory-summary">
         <Layers3 size={16} />
         <span>
-          {releases.length} releases · {artifacts.length} files ·{" "}
+          {releases.length} {releases.length === 1 ? "release" : "releases"}
+          {selection && " previewed successfully"} · {artifacts.length}{" "}
+          {artifacts.length === 1 ? "file" : "files"} ·{" "}
           {unknown ? bytes(total) + " known" : bytes(total) + " total"}
         </span>
       </div>

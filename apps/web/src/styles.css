@@ -1095,6 +1095,21 @@ dd {
   font-size: 0.82rem;
   padding-bottom: 0.5rem;
 }
+.preview-scope,
+.preview-warnings {
+  margin-bottom: 0.75rem;
+  font-size: 0.8125rem;
+}
+.preview-warnings {
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+  background: var(--warm-bg);
+  overflow-wrap: anywhere;
+}
+.preview-warnings ul {
+  margin: 0.3rem 0 0;
+  padding-left: 1.25rem;
+}
 details {
   border-top: 1px solid var(--line-soft);
   margin-top: 0.5rem;

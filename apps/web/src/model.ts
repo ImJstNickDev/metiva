@@ -148,7 +148,12 @@ export interface Artifact {
 export interface Manifest {
   releases: { version: string; channel?: string; artifacts: Artifact[] }[];
 }
+export interface SourcePreview extends Manifest {
+  selection?: { matched: number; previewed: number };
+  warnings?: { version: string; error: string }[];
+}
 export interface Activity {
+  documents_read?: number | null;
   verified_releases?: number | null;
   failed_releases?: number | null;
   id: Id;

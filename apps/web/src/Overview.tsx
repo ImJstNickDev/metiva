@@ -46,7 +46,9 @@ export function ActivityRows({ rows }: { rows: Activity[] }) {
               </td>
               <td>
                 <Status value={a.state} />
-                {a.verified_releases != null && (
+                {a.documents_read != null ? (
+                  <small>{a.documents_read.toLocaleString()} source documents read</small>
+                ) : a.verified_releases != null && (
                   <small>
                     {a.verified_releases} verified · {a.failed_releases ?? 0}{" "}
                     failed
