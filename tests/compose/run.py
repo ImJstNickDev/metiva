@@ -46,8 +46,12 @@ def main():
         assert "prod-frontend" not in cfg["services"]["metiva-api"]["networks"]
         assert "prod-frontend" not in cfg["services"]["metiva-worker"]["networks"]
         cfg["name"] = name
-        test_subnet = os.environ.get("METIVA_TEST_SUBNET", f"10.244.{secrets.randbelow(256)}.0/28")
-        cfg["networks"] = {"backend": {"internal": True, "ipam": {"config": [{"subnet": test_subnet}]}}}
+        test_subnet = os.environ.get(
+            "METIVA_TEST_SUBNET", f"10.244.{secrets.randbelow(256)}.0/28"
+        )
+        cfg["networks"] = {
+            "backend": {"internal": True, "ipam": {"config": [{"subnet": test_subnet}]}}
+        }
         services = cfg["services"]
         services["metiva"].pop("container_name")
         services["metiva"]["networks"] = ["backend"]
@@ -59,6 +63,7 @@ def main():
             services[key].setdefault("depends_on", {})["fixture"] = {
                 "condition": "service_healthy"
             }
+        services["metiva-worker"]["environment"]["METIVA_IDLE_TIMEOUT_SECS"] = "3"
         for service in services.values():
             service["restart"] = "no"
             service["healthcheck"].update(interval="2s", start_period="4s", retries=15)
@@ -151,6 +156,7 @@ ssl_certificate_key /tls/key; location / {proxy_pass http://metiva:80; proxy_buf
             compose("kill", "-s", "SIGKILL", "metiva-worker")
             compose("up", "-d", "--wait", "metiva-worker")
             client("mirror")
+            client("controls")
             compose("restart", "metiva-api", "metiva-worker", "metiva", "tls-proxy")
             client("restart")
         except BaseException:

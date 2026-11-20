@@ -86,17 +86,131 @@ def wait(check, msg, timeout=100):
     raise AssertionError(msg)
 
 
-def sync(expected="completed"):
-    job = admin(f"runtimes/{state['runtime']}/sync", "POST", {})
+def sync(expected="completed", runtime=None):
+    runtime = runtime or state["runtime"]
+    job = admin(f"runtimes/{runtime}/sync", "POST", {})
 
+    wait_job(runtime, job["id"], {expected})
+
+
+def wait_job(runtime, job, expected, timeout=100):
     def done():
-        records = admin(f"runtimes/{state['runtime']}")["history"]
-        row = next(r for r in records if r["id"] == job["id"])
-        if row["state"] in ["failed", "completed", "cancelled"]:
-            assert row["state"] == expected, row
-            return True
+        records = admin(f"runtimes/{runtime}")["history"]
+        row = next(r for r in records if r["id"] == job)
+        if row["state"] in {"failed", "completed", "cancelled"}:
+            assert row["state"] in expected, row
+            return row
 
-    wait(done, "sync never reached terminal state")
+    return wait(done, "sync never reached its expected terminal state", timeout)
+
+
+def wait_transfer(job, predicate):
+    def matching():
+        return next(
+            (
+                row
+                for row in admin("transfers")
+                if row["job_id"] == job and predicate(row)
+            ),
+            None,
+        )
+
+    return wait(matching, f"transfer for job {job} never reached expected state")
+
+
+def control_feed(filename):
+    doc = {
+        "releases": [{"version": "v1", "artifacts": [{"url": ORIGIN + "/" + filename}]}]
+    }
+    (ROOT / "controls.json").write_text(json.dumps(doc))
+
+
+def transfer_controls():
+    admin(
+        "settings",
+        "PATCH",
+        {
+            "engine": "native",
+            "concurrency": 2,
+            "per_host": 2,
+            "retries": 0,
+            "sync_interval": 3600,
+        },
+    )
+    runtime = admin(
+        f"projects/{state['project']}/runtimes",
+        "POST",
+        {"name": "Transfer controls", "slug": "controls", "visibility": "public"},
+    )["id"]
+    rt = f"runtimes/{runtime}"
+    base = "/p/atlas/r/controls"
+    control_feed("beta.bin")
+    admin(rt + "/sources", "POST", {"url": ORIGIN + "/controls.json"})
+    sync(runtime=runtime)
+
+    def start(filename):
+        control_feed(filename)
+        return admin(rt + "/sync", "POST", {})["id"]
+
+    def downloading(t):
+        return t["state"] == "downloading" and t["bytes"] > 0
+
+    # Neither manifest advertises a checksum. The origin validators alone identify the
+    # change while paused, so a mixed old prefix and new suffix would fail this check.
+    old = b"A" * (8 << 20)
+    new = b"B" * len(old)
+    (ROOT / "mutable.bin").write_bytes(old)
+    job = start("mutable.bin")
+    t = wait_transfer(job, downloading)
+    endpoint = f"transfers/{t['id']}"
+    admin(endpoint + "/pause", "POST", {})
+    paused = wait_transfer(job, lambda t: t["state"] == "paused")
+    time.sleep(0.6)
+    still = wait_transfer(job, lambda t: t["state"] == "paused")
+    assert paused["bytes"] == still["bytes"] and 0 < paused["bytes"] < len(old)
+    (ROOT / "mutable.bin").write_bytes(new)
+    admin(endpoint + "/resume", "POST", {})
+    wait_job(runtime, job, {"completed"})
+    seen = json.loads((ROOT / "mutable-range.json").read_text())
+    assert seen["if_range"] == '"' + hashlib.sha256(old).hexdigest() + '"'
+    assert seen["status"] == 200 and seen["current"] != seen["if_range"]
+    assert request(base + "/files/v1/mutable.bin", raw=True) == new
+    last_good = admin(rt)["active_publication"]
+
+    payload = b"C" * (4 << 20)
+    (ROOT / "cancel.bin").write_bytes(payload)
+    job = start("cancel.bin")
+    t = wait_transfer(job, downloading)
+    endpoint = f"transfers/{t['id']}"
+    admin(endpoint + "/cancel", "POST", {})
+    wait_transfer(job, lambda t: t["state"] == "cancelled")
+    wait_job(runtime, job, {"cancelled", "failed"})
+    assert admin(rt)["active_publication"] == last_good
+    admin(endpoint + "/retry", "POST", {})
+    replacement = wait(
+        lambda: next((j for j in admin(rt)["history"] if j["id"] > job), None),
+        "Retry did not create a new sync",
+    )
+    wait_job(runtime, replacement["id"], {"completed"})
+    assert request(base + "/files/v1/cancel.bin", raw=True) == payload
+    last_good = admin(rt)["active_publication"]
+
+    # With automatic retries off, a read timeout must fail this candidate while the
+    # previous publication and its verified bytes continue to be served.
+    (ROOT / "stall.bin").write_bytes(b"D" * 65536)
+    (ROOT / "behavior.json").write_text(json.dumps({"/stall.bin": "stall"}))
+    job = start("stall.bin")
+    wait(
+        lambda: (ROOT / "stall-started").exists(),
+        "Fixture never began the stalled response",
+    )
+    wait_job(runtime, job, {"failed"}, timeout=70)
+    failure = wait_transfer(job, lambda t: t["state"] == "failed")
+    error = (failure["error"] or "").lower()
+    assert "timeout" in error or "timed out" in error, failure
+    assert failure["retries"] == 0, failure
+    assert admin(rt)["active_publication"] == last_good
+    assert request(base + "/files/v1/cancel.bin", raw=True) == payload
 
 
 def save():
@@ -247,7 +361,37 @@ elif sys.argv[1] == "mirror":
     archived = request(f"/api/admin/archive/files/{old['id']}", admin=True, raw=True)
     assert hashlib.sha256(archived).hexdigest() == old["digest"]
     request("/_objects/" + old["digest"], status=(404,), raw=True)
+    # Paginated and uploaded sources retain independent provenance after merging.
+    combined = admin(
+        f"projects/{state['project']}/runtimes",
+        "POST",
+        {"slug": "combined", "name": "Combined", "visibility": "private"},
+    )["id"]
+    part1 = {
+        "version": "a",
+        "artifacts": [{"url": ORIGIN + "/alpha.bin", "sha256": old["digest"]}],
+    }
+    part2 = {"version": "b", "artifacts": [{"url": ORIGIN + "/beta.bin"}]}
+    page_one = {"releases": [part1], "next": "/second.json"}
+    page_two = {"releases": [part2]}
+    (ROOT / "first.json").write_text(json.dumps(page_one))
+    (ROOT / "second.json").write_text(json.dumps(page_two))
+    admin(f"runtimes/{combined}/sources", "POST", {"url": ORIGIN + "/first.json"})
+    sync(runtime=combined)
+    admin(f"runtimes/{combined}/sources", "POST", {"upload": json.dumps(page_two)})
+    sync(runtime=combined)
+    combined_view = admin(f"runtimes/{combined}")
+    assert len(combined_view["originals"]) == 3
+    assert len(combined_view["manifest"]["releases"]) == 2
+    (ROOT / "second.json").unlink()
+    sync("failed", runtime=combined)
+    assert (
+        admin(f"runtimes/{combined}")["active_publication"]
+        == combined_view["active_publication"]
+    )
     save()
+elif sys.argv[1] == "controls":
+    transfer_controls()
 elif sys.argv[1] == "restart":
 
     def healthy():

@@ -1,6 +1,7 @@
 """Independent HTTP origin. Its address exists only inside the test network namespace."""
 
 import fcntl
+import hashlib
 import json
 import socket
 import struct
@@ -29,6 +30,12 @@ class Origin(BaseHTTPRequestHandler):
         root = Path("/fixture")
         filename = {
             "/source.json": "source.json",
+            "/first.json": "first.json",
+            "/second.json": "second.json",
+            "/controls.json": "controls.json",
+            "/mutable.bin": "mutable.bin",
+            "/cancel.bin": "cancel.bin",
+            "/stall.bin": "stall.bin",
             "/alpha.bin": "alpha.bin",
             "/beta.bin": "beta.bin",
             "/gamma.bin": "gamma.bin",
@@ -41,14 +48,12 @@ class Origin(BaseHTTPRequestHandler):
             behavior = config.pop(self.path, None)
             if behavior:
                 (root / "behavior.json").write_text(json.dumps(config))
-        if behavior:
+        if isinstance(behavior, int):
             self.send_response(behavior)
             self.send_header("Retry-After", "1")
             self.end_headers()
             return
         body = (root / filename).read_bytes()
-        import hashlib
-
         tag = '"' + hashlib.sha256(body).hexdigest() + '"'
         if self.headers.get("If-None-Match") == tag:
             self.send_response(304)
@@ -58,6 +63,17 @@ class Origin(BaseHTTPRequestHandler):
         byte_range = self.headers.get("Range")
         if byte_range and self.headers.get("If-Range", tag) == tag:
             offset = int(byte_range.removeprefix("bytes=").split("-")[0])
+        if filename == "mutable.bin" and byte_range:
+            (root / "mutable-range.json").write_text(
+                json.dumps(
+                    {
+                        "range": byte_range,
+                        "if_range": self.headers.get("If-Range"),
+                        "current": tag,
+                        "status": 206 if offset else 200,
+                    }
+                )
+            )
         self.send_response(206 if offset else 200)
         if offset:
             self.send_header(
@@ -70,7 +86,12 @@ class Origin(BaseHTTPRequestHandler):
         try:
             for start in range(offset, len(body), 32768):
                 self.wfile.write(body[start : start + 32768])
-                if filename == "alpha.bin":
+                if behavior == "stall":
+                    # Deliver a real prefix and keep the socket open beyond the read deadline.
+                    (root / "stall-started").touch()
+                    time.sleep(90)
+                    return
+                if filename in {"alpha.bin", "mutable.bin", "cancel.bin"}:
                     time.sleep(0.025)
         except (BrokenPipeError, ConnectionResetError):
             pass
