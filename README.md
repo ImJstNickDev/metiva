@@ -64,6 +64,8 @@ python3 tests/compose/run.py
 
 The Compose test creates a temporary data directory, test origin and TLS proxy. It exercises publication, interrupted transfer recovery, archive access and credential rotation end to end. It requires Docker with Compose v2.24+ and OpenSSL.
 
+The [contributor guide](CONTRIBUTING.md) covers local API, worker and dashboard development.
+
 ## License
 
 Metiva is available under the [MIT license](LICENSE).
