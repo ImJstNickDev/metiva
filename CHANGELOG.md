@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.1.4
+
+- Let long-running syncs finish writing inventory while the scheduler checks for work. This prevents large syncs from stalling on SQLite writer contention.
+
 ## v0.1.3
 
 - Mirror every matching release in a nested catalogue. New selections include the whole history by default. Existing saved release limits keep their values.
