@@ -41,6 +41,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/admin/runtimes/{id}/sync", post(sync))
         .route("/api/admin/transfers", get(transfers))
+        .route("/api/admin/transfers/{id}", get(transfer_history))
         .route("/api/admin/transfers/{id}/{action}", post(control))
         .route("/api/admin/events", get(events))
         .route("/api/admin/archive", get(archive))
@@ -48,6 +49,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/overview", get(overview))
         .route("/api/admin/settings", get(settings).patch(update_settings))
         .layer(Extension(Storage::default()))
+        .layer(axum::middleware::from_fn(crate::access::json_rejections))
 }
 struct ApiError(StatusCode, String);
 impl IntoResponse for ApiError {
@@ -362,24 +364,25 @@ async fn remove_source(
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn sync(State(s): State<AppState>, Path(id): Path<i64>) -> ResultJson {
-    let mut tx = s.db.begin_with("BEGIN IMMEDIATE").await?;
-    sqlx::query("SELECT id FROM runtimes WHERE id=?")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM sources WHERE runtime_id=? AND enabled=1")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-    if count == 0 {
+async fn queue_sync(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    runtime: i64,
+) -> Result<(), ApiError> {
+    let ready:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources WHERE runtime_id=r.id AND enabled=1) FROM runtimes r WHERE r.id=?")
+        .bind(runtime).fetch_one(&mut **tx).await?;
+    if !ready {
         return Err(bad("Import a source before starting a sync"));
     }
     sqlx::query("INSERT OR IGNORE INTO jobs(runtime_id) VALUES(?)")
-        .bind(id)
-        .execute(&mut *tx)
+        .bind(runtime)
+        .execute(&mut **tx)
         .await?;
+    Ok(())
+}
+
+async fn sync(State(s): State<AppState>, Path(id): Path<i64>) -> ResultJson {
+    let mut tx = s.db.begin_with("BEGIN IMMEDIATE").await?;
+    queue_sync(&mut tx, id).await?;
     let job = record(
         sqlx::query(
             "SELECT id,state FROM jobs WHERE runtime_id=? AND state IN('queued','running')",
@@ -397,6 +400,16 @@ async fn transfer_list(s: &AppState) -> Result<Value, sqlx::Error> {
 async fn transfers(State(s): State<AppState>) -> ResultJson {
     Ok(Json(transfer_list(&s).await?))
 }
+async fn transfer_history(State(s): State<AppState>, Path(id): Path<i64>) -> ResultJson {
+    sqlx::query("SELECT id FROM transfers WHERE id=?")
+        .bind(id)
+        .fetch_one(&s.db)
+        .await?;
+    let rows=sqlx::query("SELECT created_at,state,bytes,retries,error FROM transfer_events WHERE transfer_id=? ORDER BY id DESC LIMIT 100")
+        .bind(id).fetch_all(&s.db).await?;
+    Ok(Json(json!({"history":records(rows)})))
+}
+
 async fn control(State(s): State<AppState>, Path((id, action)): Path<(i64, String)>) -> ResultJson {
     let mut tx = s.db.begin_with("BEGIN IMMEDIATE").await?;
     let row=sqlx::query("SELECT t.state,t.runtime_id,t.command,j.state job_state FROM transfers t JOIN jobs j ON j.id=t.job_id WHERE t.id=?").bind(id).fetch_one(&mut *tx).await?;
@@ -421,10 +434,7 @@ async fn control(State(s): State<AppState>, Path((id, action)): Path<(i64, Strin
                     "Wait for the current sync to finish before retrying".into(),
                 ));
             }
-            sqlx::query("INSERT OR IGNORE INTO jobs(runtime_id) VALUES(?)")
-                .bind(row.get::<i64, _>("runtime_id"))
-                .execute(&mut *tx)
-                .await?;
+            queue_sync(&mut tx, row.get("runtime_id")).await?;
         }
         ("pause", "queued" | "connecting" | "downloading" | "retrying")
         | ("resume", "paused")

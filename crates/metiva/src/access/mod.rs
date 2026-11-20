@@ -18,6 +18,46 @@ pub fn router(state: AppState) -> Router<AppState> {
     auth::router(state.clone())
         .merge(keys::router(state.clone()))
         .merge(consumer::router(state))
+        .layer(axum::middleware::from_fn(json_rejections))
+}
+
+// Axum's extractor rejections normally return plain text. Keep the dashboard and
+// consumer error contract consistent without echoing rejected credentials or bodies.
+pub(crate) async fn json_rejections(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let head = req.method() == axum::http::Method::HEAD;
+    let mut response = next.run(req).await;
+    let status = response.status();
+    if !status.is_client_error()
+        || response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|v| v.as_bytes().starts_with(b"application/json"))
+    {
+        return response;
+    }
+    let message = match status {
+        StatusCode::BAD_REQUEST => "Invalid request parameters",
+        StatusCode::UNPROCESSABLE_ENTITY => "Invalid request body",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => "Send a JSON request body",
+        StatusCode::PAYLOAD_TOO_LARGE => "Request body is too large",
+        _ => status.canonical_reason().unwrap_or("Request rejected"),
+    };
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response.headers_mut().remove(header::CONTENT_LENGTH);
+    *response.body_mut() = if head {
+        axum::body::Body::empty()
+    } else {
+        axum::body::Body::from(json!({"error":message}).to_string())
+    };
+    response
 }
 
 struct Error(StatusCode, &'static str);
