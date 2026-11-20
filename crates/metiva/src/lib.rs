@@ -30,6 +30,13 @@ pub struct SourceInput {
     pub mapping: Option<Value>,
 }
 
+pub(crate) fn unix_time() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 pub async fn open(data: &Path, origin: &str) -> Result<AppState> {
     let url = url::Url::parse(origin).context("METIVA_PUBLIC_URL requires an HTTP(S) origin")?;
     ensure!(

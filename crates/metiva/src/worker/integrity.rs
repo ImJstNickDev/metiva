@@ -19,16 +19,39 @@ fn consume(reader: impl Read, remaining: &mut u64) -> Result<()> {
 fn check_tar(reader: impl Read) -> Result<()> {
     let mut archive = tar::Archive::new(reader.take(MAX_EXPANDED + 1));
     let mut remaining = MAX_EXPANDED;
-    for (index, entry) in archive.entries()?.enumerate() {
+    // Raw iteration streams extension entries too, keeping path and PAX metadata out of memory.
+    for (index, entry) in archive.entries()?.raw(true).enumerate() {
         ensure!(index < MAX_MEMBERS, "too many archive members");
-        consume(entry?, &mut remaining)?;
+        let mut entry = entry?;
+        let expected = entry.size();
+        let before = remaining;
+        consume(&mut entry, &mut remaining)?;
+        ensure!(before - remaining == expected, "truncated tar member");
     }
-    // Read through the compressed trailer as well, so CRC and truncation errors surface.
+    // The tar reader stops on its first zero block. Require the second terminator
+    // and consume the compressed trailer to surface both truncation and CRC errors.
     let mut reader = archive.into_inner();
-    consume(&mut reader, &mut remaining)?;
+    let mut end = [0u8; 512];
+    reader
+        .read_exact(&mut end)
+        .context("missing tar terminator")?;
+    ensure!(end.iter().all(|b| *b == 0), "invalid tar terminator");
+    let mut padding = [0u8; 8192];
+    let mut length = 0u64;
+    loop {
+        let n = reader.read(&mut padding)?;
+        if n == 0 {
+            break;
+        }
+        ensure!(
+            padding[..n].iter().all(|b| *b == 0),
+            "unexpected trailing tar data"
+        );
+        length += n as u64;
+    }
     ensure!(
-        reader.limit() > 0,
-        "archive exceeds uncompressed byte limit"
+        reader.limit() > 0 && length.is_multiple_of(512),
+        "invalid tar padding or archive exceeds uncompressed byte limit"
     );
     Ok(())
 }
@@ -140,6 +163,19 @@ mod tests {
         hashes.insert("md5".into(), "00000000000000000000000000000000".into());
         assert!(verify(file.path(), "abc.bin", None, None, &hashes).is_err());
         assert!(verify(file.path(), "broken.zip", None, None, &BTreeMap::new()).is_err());
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(3);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "hello", b"abc".as_slice())
+            .unwrap();
+        let tar = archive.into_inner().unwrap();
+        std::fs::write(file.path(), &tar).unwrap();
+        assert!(verify(file.path(), "valid.tar", None, None, &BTreeMap::new()).is_ok());
+        std::fs::write(file.path(), &tar[..514]).unwrap();
+        assert!(verify(file.path(), "truncated.tar", None, None, &BTreeMap::new()).is_err());
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(b"compressed").unwrap();
         let mut data = gz.finish().unwrap();

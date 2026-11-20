@@ -34,7 +34,7 @@ pub async fn preview(state: &AppState, input: &SourceInput) -> Result<Value> {
         mapping: mapping(input.mapping.clone())?,
     };
     let mut catalog = Catalog::new();
-    feed::collect(state, &source, None, false, &mut catalog).await?;
+    feed::collect(state, &source, None, false, &mut catalog, None).await?;
     Ok(json!({"releases":adapter::releases(&catalog)}))
 }
 
@@ -200,25 +200,64 @@ async fn publish(
 }
 
 async fn sync(state: &AppState, runtime: i64, job: i64, limits: Arc<http::Limits>) -> Result<()> {
-    let row=sqlx::query("SELECT p.slug AS project,r.slug,r.active_publication FROM runtimes r JOIN projects p ON p.id=r.project_id WHERE r.id=?").bind(runtime).fetch_one(&state.db).await?;
+    let row=sqlx::query("SELECT p.slug AS project,r.slug,r.active_publication,pub.manifest FROM runtimes r JOIN projects p ON p.id=r.project_id LEFT JOIN publications pub ON pub.id=r.active_publication WHERE r.id=?").bind(runtime).fetch_one(&state.db).await?;
     let project: String = row.get("project");
     let slug: String = row.get("slug");
     let active: Option<i64> = row.get("active_publication");
     let inputs = sources(state, runtime).await?;
-    let (catalog, mut observations) = feed::observe(state, &inputs, job, true).await?;
-    let previous: Vec<(String, String)> =
-        sqlx::query_as("SELECT release,filename FROM files WHERE publication_id=?")
-            .bind(active)
-            .fetch_all(&state.db)
+    let saved =
+        sqlx::query("SELECT previous_publication,observation_ids FROM job_plans WHERE job_id=?")
+            .bind(job)
+            .fetch_optional(&state.db)
             .await?;
-    if previous.iter().any(|key| !catalog.assets.contains_key(key)) {
-        let (confirmation, checked) = feed::observe(state, &inputs, job, false).await?;
+    let (catalog, observations) = if let Some(plan) = saved {
         ensure!(
-            catalog == confirmation,
-            "independent source check disagreed with proposed removals"
+            active == plan.get::<Option<i64>, _>("previous_publication"),
+            "publication changed while a synchronization was waiting"
         );
-        observations = checked;
-    }
+        feed::restore(state, job, plan.get::<&str, _>("observation_ids"), &inputs).await?
+    } else {
+        let (catalog, mut observations) = feed::observe(state, &inputs, job, true, &limits).await?;
+        let previous: Vec<(String, String)> =
+            sqlx::query_as("SELECT release,filename FROM files WHERE publication_id=?")
+                .bind(active)
+                .fetch_all(&state.db)
+                .await?;
+        let old_manifest: Option<Value> = row
+            .get::<Option<String>, _>("manifest")
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
+        let release_removed = old_manifest
+            .as_ref()
+            .and_then(|m| m.get("releases"))
+            .and_then(Value::as_array)
+            .is_some_and(|releases| {
+                releases
+                    .iter()
+                    .filter_map(|r| r.get("version")?.as_str())
+                    .any(|v| !catalog.versions.contains_key(v))
+            });
+        if release_removed || previous.iter().any(|key| !catalog.assets.contains_key(key)) {
+            let (confirmation, checked) =
+                feed::observe(state, &inputs, job, false, &limits).await?;
+            ensure!(
+                catalog == confirmation,
+                "independent source check disagreed with proposed removals"
+            );
+            observations = checked;
+        }
+        let ids: Vec<_> = observations.iter().map(|o| o.id).collect();
+        sqlx::query(
+            "INSERT INTO job_plans(job_id,previous_publication,observation_ids) VALUES(?,?,?)",
+        )
+        .bind(job)
+        .bind(active)
+        .bind(serde_json::to_string(&ids)?)
+        .execute(&state.db)
+        .await?;
+        (catalog, observations)
+    };
     let options = settings(state).await?;
     let mut transfers = Vec::with_capacity(catalog.assets.len());
     for ((release, name), item) in &catalog.assets {
@@ -242,8 +281,13 @@ async fn sync(state: &AppState, runtime: i64, job: i64, limits: Arc<http::Limits
         })
         .buffer_unordered((options.concurrency * 2).clamp(2, 64));
     let mut mirror = catalog.clone();
+    let mut deferred = false;
     while let Some(((release, name), result)) = pending.next().await {
-        let (digest, size) = result.with_context(|| format!("artifact {release}/{name}"))?;
+        let Some((digest, size)) = result.with_context(|| format!("artifact {release}/{name}"))?
+        else {
+            deferred = true;
+            continue;
+        };
         let mut url = Url::parse(&state.public_url)?;
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("invalid public origin"))?
@@ -256,6 +300,9 @@ async fn sync(state: &AppState, runtime: i64, job: i64, limits: Arc<http::Limits
         asset.url = url;
         asset.sha256 = Some(digest);
         asset.size = Some(size);
+    }
+    if deferred {
+        return Ok(());
     }
     let upstream = if inputs.len() == 1 && observations.len() == 1 {
         let row=sqlx::query("SELECT d.body,o.url FROM source_observations o JOIN raw_documents d ON d.digest=o.digest WHERE o.id=?").bind(observations[0].id).fetch_one(&state.db).await?;
@@ -319,18 +366,20 @@ pub async fn run(state: AppState) -> Result<()> {
     let options = settings(&state).await?;
     let mut limits = Arc::new(http::Limits::new(options.concurrency, options.per_host));
     let mut work = FuturesUnordered::new();
+    let mut active_jobs = std::collections::BTreeSet::new();
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            Some(result)=work.next(), if !work.is_empty()=>result?,
+            Some((id,result))=work.next(), if !work.is_empty()=>{active_jobs.remove(&id);result?;},
             _=timer.tick()=>{
                 sqlx::query("INSERT OR IGNORE INTO jobs(runtime_id) SELECT r.id FROM runtimes r WHERE EXISTS(SELECT 1 FROM sources s WHERE s.runtime_id=r.id AND s.enabled=1) AND (r.last_checked IS NULL OR r.last_checked+r.sync_interval<=unixepoch())").execute(&state.db).await?;
                 if work.is_empty() {let options=settings(&state).await?; limits=Arc::new(http::Limits::new(options.concurrency,options.per_host));}
                 while work.len()<4 {
-                    let claimed:Option<(i64,i64)>=sqlx::query_as("UPDATE jobs SET state='running' WHERE id=(SELECT id FROM jobs WHERE state='queued' ORDER BY id LIMIT 1) RETURNING id,runtime_id").fetch_optional(&state.db).await?;
+                    let claimed:Option<(i64,i64)>=sqlx::query_as("UPDATE jobs SET state='running' WHERE id=(SELECT j.id FROM jobs j WHERE j.id NOT IN(SELECT value FROM json_each(?)) AND (j.state='queued' OR (j.state='running' AND EXISTS(SELECT 1 FROM transfers t WHERE t.job_id=j.id AND (t.command IS NOT NULL OR t.state IN('queued','downloading','connecting','verifying') OR (t.state='retrying' AND coalesce(t.retry_at,0)<=unixepoch()))))) ORDER BY j.id LIMIT 1) RETURNING id,runtime_id").bind(serde_json::to_string(&active_jobs)?).fetch_optional(&state.db).await?;
                     let Some((job,runtime))=claimed else {break};
-                    work.push(process(state.clone(),runtime,job,limits.clone()));
+                    active_jobs.insert(job);let s=state.clone();let l=limits.clone();
+                    work.push(async move{(job,process(s,runtime,job,l).await)});
                 }
             }
         }
@@ -461,5 +510,99 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+    #[tokio::test]
+    async fn parked_transfers_yield_to_ready_work_and_recover_the_frozen_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::open(dir.path(), "https://mirror.example")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE settings SET concurrency=1,per_host=1")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO projects(name,slug) VALUES('P','p')")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let digest = hex::encode(Sha256::digest(b"content"));
+        tokio::fs::write(state.data.join("artifacts").join(&digest), b"content")
+            .await
+            .unwrap();
+        let assets:Vec<_>=["a","b","c"].iter().map(|n|json!({"filename":n,"url":format!("https://files.example/{n}"),"sha256":digest})).collect();
+        let upload = json!({"releases":[{"version":"frozen","artifacts":assets}]}).to_string();
+        let mut catalog = Catalog::new();
+        adapter::GenericJson
+            .parse_page(upload.as_bytes(), &Mapping::default(), None, &mut catalog)
+            .unwrap();
+        for runtime in 1..=5i64 {
+            sqlx::query("INSERT INTO runtimes(id,project_id,name,slug) VALUES(?,1,'R',?)")
+                .bind(runtime)
+                .bind(format!("r{runtime}"))
+                .execute(&state.db)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO sources(runtime_id,kind,upload) VALUES(?,'upload',?)")
+                .bind(runtime)
+                .bind(upload.as_bytes())
+                .execute(&state.db)
+                .await
+                .unwrap();
+            let job = sqlx::query("INSERT INTO jobs(runtime_id) VALUES(?)")
+                .bind(runtime)
+                .execute(&state.db)
+                .await
+                .unwrap()
+                .last_insert_rowid();
+            if runtime < 5 {
+                for name in ["a", "b"] {
+                    let item = &catalog.assets[&("frozen".to_string(), name.to_string())];
+                    let id = prepare(&state, job, runtime, "frozen", name, item, "native")
+                        .await
+                        .unwrap();
+                    sqlx::query("UPDATE transfers SET state='paused' WHERE id=?")
+                        .bind(id)
+                        .execute(&state.db)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        let worker = tokio::spawn(run(state.clone()));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if sqlx::query_scalar::<_, Option<i64>>(
+                    "SELECT active_publication FROM runtimes WHERE id=5",
+                )
+                .fetch_one(&state.db)
+                .await
+                .unwrap()
+                .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM transfers WHERE runtime_id<5 AND filename='c' AND state='completed'").fetch_one(&state.db).await.unwrap(),4);
+        worker.abort();
+        let _ = worker.await;
+        // Simulate the upstream changing after a crash. Recovery must use the admitted bytes.
+        sqlx::query("UPDATE sources SET upload=? WHERE runtime_id=1")
+            .bind(b"{\"releases\":[]}".as_slice())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE transfers SET command='resume' WHERE runtime_id=1 AND state='paused'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let worker = tokio::spawn(run(state.clone()));
+        tokio::time::timeout(Duration::from_secs(15),async{loop{if sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM files JOIN publications p ON p.id=publication_id WHERE p.runtime_id=1 AND release='frozen'").fetch_one(&state.db).await.unwrap()==3 {break;}tokio::time::sleep(Duration::from_millis(50)).await;}}).await.unwrap();
+        worker.abort();
+        let _ = worker.await;
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM source_observations o JOIN sources s ON s.id=o.source_id WHERE s.runtime_id=1").fetch_one(&state.db).await.unwrap(),1);
     }
 }

@@ -334,7 +334,17 @@ impl Scan<'_> {
     }
     fn release(&mut self, release: &Value, path: &str, key: Option<&str>) -> Result<()> {
         let m = self.mapping;
-        let version = match select(release, &m.version_path, VERSION) {
+        let version_keys = if key.is_some() {
+            &["version", "tag_name", "release"][..]
+        } else {
+            VERSION
+        };
+        let version_field = select(release, &m.version_path, version_keys);
+        ensure!(
+            m.version_path.is_none() || version_field.is_some(),
+            "configured release version is missing"
+        );
+        let version = match &version_field {
             Some((_, Value::String(v))) => segment(v)?,
             Some((_, Value::Number(n))) => segment(&n.to_string())?,
             None => segment(key.context("release version is missing")?)?,
@@ -344,7 +354,7 @@ impl Scan<'_> {
         let mut meta = Map::new();
         if assets.is_some() {
             meta = release.as_object().cloned().unwrap_or_default();
-            if let Some((p, _)) = select(release, &m.version_path, VERSION)
+            if let Some((p, _)) = &version_field
                 && let Some(k) = p.split('/').nth(1)
             {
                 meta.remove(&k.replace("~1", "/").replace("~0", "~"));
@@ -569,7 +579,7 @@ mod tests {
     }
     #[test]
     fn platform_maps_release_metadata_and_conflicts() {
-        let feed = json!({"versions":{"rolling":{"channel":"stable","platforms":{"linux-x64":{"url":"https://example.com/pkg.bin", "arch":"x64"}}},"pending":{"files":[]}}});
+        let feed = json!({"versions":{"rolling":{"name":"Display title","channel":"stable","platforms":{"linux-x64":{"url":"https://example.com/pkg.bin", "arch":"x64"}}},"pending":{"files":[]}}});
         let mut found = Catalog::new();
         parse(
             feed.to_string().as_bytes(),

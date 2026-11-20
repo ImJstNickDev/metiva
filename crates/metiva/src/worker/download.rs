@@ -16,7 +16,7 @@ use std::{
 use tokio::{fs, io::AsyncWriteExt};
 
 fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+    crate::unix_time()
 }
 fn limit() -> u64 {
     std::env::var("METIVA_MAX_ARTIFACT_BYTES")
@@ -41,6 +41,22 @@ fn strong_tag(headers: &HeaderMap) -> Option<String> {
         .ok()
         .filter(|s| s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
         .map(str::to_string)
+}
+
+async fn staging_length(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(path).await {
+        Ok(meta) => {
+            ensure!(meta.is_file(), "staging path must be a regular file");
+            if meta.nlink() > 1 {
+                fs::remove_file(path).await?;
+                return Ok(0);
+            }
+            Ok(meta.len())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub(crate) struct Transfer {
@@ -82,30 +98,23 @@ impl Transfer {
         };
         // A digest name can only expose complete, durable bytes. Retain all objects for history.
         let target = state.data.join("artifacts").join(&digest);
-        match fs::hard_link(path, &target).await {
-            Ok(()) => {
-                fs::File::open(state.data.join("artifacts"))
-                    .await?
-                    .sync_all()
-                    .await?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if self
-                    .verify(target.clone(), Some(digest.clone()))
-                    .await
-                    .is_err()
-                {
-                    fs::rename(path, &target).await?;
-                    fs::File::open(state.data.join("artifacts"))
-                        .await?
-                        .sync_all()
-                        .await?;
-                    return Ok((digest, size));
-                }
-            }
-            Err(e) => return Err(e.into()),
+        if fs::try_exists(&target).await?
+            && self
+                .verify(target.clone(), Some(digest.clone()))
+                .await
+                .is_ok()
+        {
+            fs::remove_file(path).await?;
+        } else {
+            // Rename cannot leave any mutable staging path aliased to a published inode.
+            fs::rename(path, &target).await?;
         }
-        fs::remove_file(path).await?;
+        for dir in ["artifacts", "staging"] {
+            fs::File::open(state.data.join(dir))
+                .await?
+                .sync_all()
+                .await?;
+        }
         Ok((digest, size))
     }
 
@@ -121,6 +130,8 @@ impl Transfer {
             .map(|d| format!("sha256:{d}"))
             .unwrap_or_else(|| self.item.url.to_string());
         let _object = self.limits.object(identity).await?;
+        let path = self.path(state);
+        let offset = staging_length(&path).await?;
         let row = sqlx::query("SELECT validator,effective_url,digest FROM transfers WHERE id=?")
             .bind(self.id)
             .fetch_one(&state.db)
@@ -144,12 +155,6 @@ impl Transfer {
         }
         let previous=sqlx::query("SELECT digest,validator,effective_url FROM transfers WHERE id<>? AND state='completed' AND source_url=? AND validator IS NOT NULL AND digest IS NOT NULL ORDER BY id DESC LIMIT 1").bind(self.id).bind(self.item.url.as_str()).fetch_optional(&state.db).await?;
         let mut revalidate = previous.is_some() && self.item.sha256.is_none();
-        let path = self.path(state);
-        let offset = match fs::metadata(&path).await {
-            Ok(m) => m.len(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(e) => return Err(e.into()),
-        };
         let tag: Option<String> = row.get("validator");
         let previous_url: Option<String> = row.get("effective_url");
         let mut range =
@@ -320,13 +325,14 @@ impl Transfer {
         }
     }
 
-    pub async fn run(&self, state: &AppState) -> Result<(String, u64)> {
+    pub async fn run(&self, state: &AppState) -> Result<Option<(String, u64)>> {
         loop {
-            let row =
-                sqlx::query("SELECT state,command,retries,retry_at FROM transfers WHERE id=?")
-                    .bind(self.id)
-                    .fetch_one(&state.db)
-                    .await?;
+            let row = sqlx::query(
+                "SELECT state,command,retries,retry_at,digest FROM transfers WHERE id=?",
+            )
+            .bind(self.id)
+            .fetch_one(&state.db)
+            .await?;
             let status: String = row.get("state");
             let cmd: Option<String> = row.get("command");
             if cmd.as_deref() == Some("cancel") || status == "cancelled" {
@@ -336,6 +342,14 @@ impl Transfer {
             if cmd.as_deref() == Some("pause") {
                 sqlx::query("UPDATE transfers SET state='paused',speed=0,command=NULL WHERE id=? AND command='pause'").bind(self.id).execute(&state.db).await?;
                 continue;
+            }
+            if status == "completed"
+                && let Some(digest) = row.get::<Option<String>, _>("digest")
+                && let Ok(verified) = self
+                    .verify(state.data.join("artifacts").join(&digest), Some(digest))
+                    .await
+            {
+                return Ok(Some(verified));
             }
             let origin_delay: Option<i64> = sqlx::query_scalar(
                 "SELECT retry_after FROM origin_cooldowns WHERE host=? AND retry_after>unixepoch()",
@@ -347,16 +361,14 @@ impl Transfer {
                 && (status != "paused" || cmd.as_deref() == Some("resume"))
             {
                 sqlx::query("UPDATE transfers SET retry_at=max(coalesce(retry_at,0),?),state='retrying',command=CASE WHEN command IN('resume','retry') THEN NULL ELSE command END WHERE id=?").bind(deadline).bind(self.id).execute(&state.db).await?;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
+                return Ok(None);
             }
             if status == "paused" && cmd.as_deref() != Some("resume")
                 || status == "retrying"
                     && cmd.as_deref() != Some("retry")
                     && row.get::<Option<i64>, _>("retry_at").unwrap_or(0) > now()
             {
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                continue;
+                return Ok(None);
             }
             if let Some(cmd) = cmd {
                 sqlx::query(
@@ -373,8 +385,10 @@ impl Transfer {
             };
             match result {
                 Ok((digest, size)) => {
-                    sqlx::query("UPDATE transfers SET state='completed',bytes=?,total=?,speed=0,digest=?,retry_at=NULL,error=NULL,command=NULL WHERE id=?").bind(size as i64).bind(size as i64).bind(&digest).bind(self.id).execute(&state.db).await?;
-                    return Ok((digest, size));
+                    let changed=sqlx::query("UPDATE transfers SET state='completed',bytes=?,total=?,speed=0,digest=?,retry_at=NULL,error=NULL,command=NULL WHERE id=? AND coalesce(command,'') NOT IN('pause','cancel')").bind(size as i64).bind(size as i64).bind(&digest).bind(self.id).execute(&state.db).await?;
+                    if changed.rows_affected() == 1 {
+                        return Ok(Some((digest, size)));
+                    }
                 }
                 Err(error) => {
                     let retries: u32 = row.get("retries");
@@ -398,12 +412,24 @@ impl Transfer {
 mod tests {
     use super::*;
     #[test]
+    fn legacy_stage_alias_is_detached_before_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let object = dir.path().join("digest");
+        let stage = dir.path().join("stage");
+        std::fs::write(&object, b"published").unwrap();
+        std::fs::hard_link(&object, &stage).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(rt.block_on(staging_length(&stage)).unwrap(), 0);
+        std::fs::write(&stage, b"replacement").unwrap();
+        assert_eq!(std::fs::read(object).unwrap(), b"published");
+    }
+    #[test]
     fn retry_after_dates_and_bounds() {
         let clock = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         assert_eq!(http::retry_after("90", clock), Some(90));
         assert_eq!(http::retry_after("999999999", clock), Some(86400));
         assert_eq!(
-            retry_after(
+            http::retry_after(
                 &httpdate::fmt_http_date(clock + Duration::from_secs(11)),
                 clock
             ),

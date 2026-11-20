@@ -43,18 +43,68 @@ struct Page {
 fn header(headers: &HeaderMap, key: HeaderName) -> Option<String> {
     headers.get(key)?.to_str().ok().map(str::to_string)
 }
-fn next_link(value: &str) -> Option<String> {
-    value.split(',').find_map(|part| {
-        let (target, params) = part.trim().strip_prefix('<')?.split_once('>')?;
-        let next = params
+fn link_header(headers: &HeaderMap) -> Result<Option<String>> {
+    let values = headers
+        .get_all(LINK)
+        .iter()
+        .map(|v| v.to_str())
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((!values.is_empty()).then(|| values.join(",")))
+}
+fn next_link(value: &str) -> Result<Option<String>> {
+    let mut start = 0;
+    let mut angle = false;
+    let mut quoted = false;
+    let mut escape = false;
+    let mut links = Vec::new();
+    for (i, c) in value.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && quoted {
+            escape = true;
+            continue;
+        }
+        match c {
+            '"' if !angle => quoted = !quoted,
+            '<' if !quoted => angle = true,
+            '>' if !quoted => angle = false,
+            ',' if !angle && !quoted => {
+                links.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => (),
+        }
+    }
+    ensure!(!angle && !quoted, "malformed pagination Link header");
+    links.push(&value[start..]);
+    let mut next = None;
+    for link in links {
+        let (target, params) = link
+            .trim()
+            .strip_prefix('<')
+            .and_then(|v| v.split_once('>'))
+            .context("invalid pagination Link header")?;
+        let rel = params
             .split(';')
-            .filter_map(|p| p.trim().split_once('='))
+            .filter_map(|v| v.trim().split_once('='))
             .any(|(k, v)| {
-                k.eq_ignore_ascii_case("rel")
-                    && v.trim_matches('"').split_whitespace().any(|r| r == "next")
+                k.trim().eq_ignore_ascii_case("rel")
+                    && v.trim()
+                        .trim_matches('"')
+                        .split_whitespace()
+                        .any(|r| r.eq_ignore_ascii_case("next"))
             });
-        next.then(|| target.to_owned())
-    })
+        if rel {
+            ensure!(
+                next.as_deref().is_none_or(|v| v == target),
+                "conflicting pagination links"
+            );
+            next = Some(target.to_string());
+        }
+    }
+    Ok(next)
 }
 
 async fn remote(
@@ -63,6 +113,7 @@ async fn remote(
     url: &Url,
     conditional: bool,
     max_retries: u32,
+    limits: Option<&http::Limits>,
 ) -> Result<Page> {
     let cached = if conditional {
         sqlx::query("SELECT o.url,o.etag,o.last_modified,o.next_link,o.digest FROM source_observations o WHERE source_id=? AND request_url=? ORDER BY id DESC LIMIT 1").bind(source).bind(url.as_str()).fetch_optional(&state.db).await?
@@ -86,7 +137,8 @@ async fn remote(
     let validators = headers.contains_key(IF_NONE_MATCH) || headers.contains_key(IF_MODIFIED_SINCE);
     let mut retries = 0;
     let response = loop {
-        let fetched = http::limited_get(&state.db, url.clone(), headers.clone(), false, None).await;
+        let fetched =
+            http::limited_get(&state.db, url.clone(), headers.clone(), false, limits).await;
         if retries == max_retries
             || fetched
                 .as_ref()
@@ -97,7 +149,7 @@ async fn remote(
         let backoff = 2_i64.pow(retries.min(8) + 1) + i64::from(rand::random::<u8>() % 3);
         let delay = http::cooldown(&state.db, url.host_str().context("missing host")?)
             .await?
-            .map(|d| d - chrono::Utc::now().timestamp())
+            .map(|d| d - crate::unix_time())
             .unwrap_or(0)
             .max(backoff);
         ensure!(
@@ -124,7 +176,7 @@ async fn remote(
             url: Some(response.url),
             etag: header(&response.headers, ETAG).or_else(|| row.get("etag")),
             modified: header(&response.headers, LAST_MODIFIED).or_else(|| row.get("last_modified")),
-            link: header(&response.headers, LINK).or_else(|| row.get("next_link")),
+            link: link_header(&response.headers)?.or_else(|| row.get("next_link")),
         });
     }
     ensure!(
@@ -135,7 +187,7 @@ async fn remote(
     let page_url = response.url.clone();
     let etag = header(&response.headers, ETAG);
     let modified = header(&response.headers, LAST_MODIFIED);
-    let link = header(&response.headers, LINK);
+    let link = link_header(&response.headers)?;
     Ok(Page {
         bytes: response.bounded(PAGE_BYTES).await?,
         url: Some(page_url),
@@ -179,6 +231,7 @@ pub(crate) async fn collect(
     job: Option<i64>,
     conditional: bool,
     catalog: &mut Catalog,
+    limits: Option<&http::Limits>,
 ) -> Result<Vec<Observation>> {
     ensure!(
         source.url.is_some() != source.upload.is_some(),
@@ -197,7 +250,7 @@ pub(crate) async fn collect(
         let request = next.take();
         let page = if let Some(url) = &request {
             ensure!(seen.insert(url.clone()), "pagination cycle");
-            remote(state, source.id, url, conditional, max_retries).await?
+            remote(state, source.id, url, conditional, max_retries, limits).await?
         } else {
             let bytes = source.upload.as_ref().context("missing source data")?;
             ensure!(
@@ -235,7 +288,7 @@ pub(crate) async fn collect(
         adapter::merge(catalog, local)?;
         if next.is_none()
             && source.mapping.next_path.is_none()
-            && let Some(link) = page.link.as_deref().and_then(next_link)
+            && let Some(link) = page.link.as_deref().map(next_link).transpose()?.flatten()
         {
             next = Some(
                 page.url
@@ -245,6 +298,18 @@ pub(crate) async fn collect(
             );
         }
         if next.is_none() {
+            let document: serde_json::Value = serde_json::from_slice(&page.bytes)?;
+            ensure!(
+                ![
+                    "/has_more",
+                    "/hasMore",
+                    "/pagination/has_more",
+                    "/pageInfo/hasNextPage"
+                ]
+                .iter()
+                .any(|p| document.pointer(p).and_then(serde_json::Value::as_bool) == Some(true)),
+                "manifest reports additional pages without a next URL"
+            );
             return Ok(observations);
         }
     }
@@ -256,6 +321,7 @@ pub(crate) async fn observe(
     sources: &[Source],
     job: i64,
     conditional: bool,
+    limits: &http::Limits,
 ) -> Result<(Catalog, Vec<Observation>)> {
     let mut catalog = Catalog::new();
     let mut observations = Vec::new();
@@ -266,7 +332,16 @@ pub(crate) async fn observe(
         .bind(source.id)
         .execute(&state.db)
         .await?;
-        match collect(state, source, Some(job), conditional, &mut catalog).await {
+        match collect(
+            state,
+            source,
+            Some(job),
+            conditional,
+            &mut catalog,
+            Some(limits),
+        )
+        .await
+        {
             Ok(rows) => {
                 observations.extend(rows);
                 sqlx::query(
@@ -289,13 +364,59 @@ pub(crate) async fn observe(
     Ok((catalog, observations))
 }
 
+/// Reconstruct the exact admitted input without polling a mutable upstream during recovery.
+pub(crate) async fn restore(
+    state: &AppState,
+    job: i64,
+    ids: &str,
+    sources: &[Source],
+) -> Result<(Catalog, Vec<Observation>)> {
+    use futures_util::TryStreamExt;
+    let by_id: std::collections::BTreeMap<_, _> = sources.iter().map(|s| (s.id, s)).collect();
+    let mut seen = HashSet::new();
+    let mut pages=sqlx::query("SELECT o.id,o.source_id,o.digest,o.url,d.body FROM json_each(?) j JOIN source_observations o ON o.id=j.value JOIN raw_documents d USING(digest) WHERE o.job_id=? ORDER BY j.key").bind(ids).bind(job).fetch(&state.db);
+    let mut catalog = Catalog::new();
+    let mut observations = Vec::new();
+    while let Some(row) = pages.try_next().await? {
+        let id: i64 = row.get("source_id");
+        let source = by_id
+            .get(&id)
+            .context("accepted source changed during recovery")?;
+        seen.insert(id);
+        let url = row
+            .get::<Option<String>, _>("url")
+            .as_deref()
+            .map(Url::parse)
+            .transpose()?;
+        adapter::GenericJson.parse_page(
+            &row.get::<Vec<u8>, _>("body"),
+            &source.mapping,
+            url.as_ref(),
+            &mut catalog,
+        )?;
+        observations.push(Observation {
+            id: row.get("id"),
+            source: id,
+            digest: row.get("digest"),
+        });
+    }
+    ensure!(
+        seen.len() == sources.len()
+            && serde_json::from_str::<Vec<i64>>(ids)?.len() == observations.len(),
+        "accepted input set is incomplete"
+    );
+    Ok((catalog, observations))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn finds_next_relation() {
         assert_eq!(
-            next_link("<prev>; rel=\"prev\", </feed?page=2>; rel=\"next\"").as_deref(),
+            next_link("<prev>; rel=\"prev\", </feed?page=2>; rel=\"next\"")
+                .unwrap()
+                .as_deref(),
             Some("/feed?page=2")
         );
     }

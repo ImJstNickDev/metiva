@@ -416,7 +416,7 @@ pub(crate) async fn limited_get(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| retry_after(v, std::time::SystemTime::now()))
         {
-            let until = chrono::Utc::now().timestamp() + delay;
+            let until = crate::unix_time() + delay;
             set_cooldown(db, &host, until).await?;
             if original != host {
                 set_cooldown(db, &original, until).await?;

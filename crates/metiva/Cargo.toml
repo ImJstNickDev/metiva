@@ -9,11 +9,10 @@ license = "MIT"
 anyhow = "1"
 argon2 = "0.5"
 axum = { version = "0.8", features = ["json"] }
-chrono = "0.4"
 fs2 = "0.4"
 flate2 = "1"
 tar = "0.4"
-zip = { version = "4", default-features = false, features = ["deflate","bzip2","zstd"] }
+zip = { version = "9.8.1", default-features = false, features = ["deflate","bzip2","zstd"] }
 rpassword = "7"
 futures-util = "0.3"
 hex = "0.4"
