@@ -21,7 +21,7 @@ use futures_util::{
 };
 use serde_json::{Value, json};
 use sqlx::Row;
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
 use url::Url;
 
 fn mapping(value: Option<Value>) -> Result<Mapping> {
@@ -518,6 +518,92 @@ async fn process(state: AppState, runtime: i64, job: i64, limits: Arc<http::Limi
     Ok(())
 }
 
+// Poll job futures even while a scheduler query waits for a write lock. A job
+// can hold that very lock across awaits until its inventory or publication commits.
+async fn drive_until<F, T>(
+    work: &mut FuturesUnordered<F>,
+    active: &mut BTreeSet<i64>,
+    until: T,
+) -> Result<T::Output>
+where
+    F: Future<Output = (i64, Result<()>)>,
+    T: Future,
+{
+    tokio::pin!(until);
+    loop {
+        tokio::select! {
+            ready = &mut until => return Ok(ready),
+            Some((job, result)) = work.next(), if !work.is_empty() => {
+                active.remove(&job);
+                result?;
+            }
+        }
+    }
+}
+
+fn sqlite_busy(error: &sqlx::Error) -> bool {
+    // Extended result codes inherit the primary code in the low byte.
+    error
+        .as_database_error()
+        .and_then(|e| e.code())
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| code & 0xff == 5)
+}
+
+async fn schedule_tick(
+    state: &AppState,
+    mut active: BTreeSet<i64>,
+    limits: &mut Arc<http::Limits>,
+) -> Result<Vec<(i64, i64)>> {
+    let queued = sqlx::query(
+        "INSERT OR IGNORE INTO jobs(runtime_id)
+         SELECT r.id FROM runtimes r JOIN projects p ON p.id=r.project_id
+         WHERE r.parked_at IS NULL AND p.parked_at IS NULL
+         AND EXISTS(SELECT 1 FROM sources s WHERE s.runtime_id=r.id AND s.enabled=1)
+         AND (r.last_checked IS NULL OR r.last_checked+r.sync_interval<=unixepoch())",
+    )
+    .execute(&state.db)
+    .await;
+    if let Err(error) = queued {
+        if sqlite_busy(&error) {
+            return Ok(Vec::new());
+        }
+        return Err(error.into());
+    }
+    if active.is_empty() {
+        let options = settings(state).await?;
+        *limits = Arc::new(http::Limits::new(options.concurrency, options.per_host));
+    }
+    let mut claims = Vec::new();
+    while active.len() < 4 {
+        let claim = sqlx::query_as(
+            "UPDATE jobs SET state='running' WHERE id=(
+             SELECT j.id FROM jobs j JOIN runtimes r ON r.id=j.runtime_id
+             JOIN projects p ON p.id=r.project_id
+             WHERE r.parked_at IS NULL AND p.parked_at IS NULL
+             AND j.id NOT IN(SELECT value FROM json_each(?))
+             AND (j.state='queued' OR (j.state='running' AND EXISTS(
+                 SELECT 1 FROM transfers t WHERE t.job_id=j.id AND (t.command IS NOT NULL
+                 OR t.state IN('queued','downloading','connecting','verifying')
+                 OR (t.state='retrying' AND coalesce(t.retry_at,0)<=unixepoch())))))
+             ORDER BY j.id LIMIT 1) RETURNING id,runtime_id",
+        )
+        .bind(serde_json::to_string(&active)?)
+        .fetch_optional(&state.db)
+        .await;
+        match claim {
+            Ok(Some((job, runtime))) => {
+                active.insert(job);
+                claims.push((job, runtime));
+            }
+            Ok(None) => break,
+            Err(error) if sqlite_busy(&error) => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(claims)
+}
+
 pub async fn run(state: AppState) -> Result<()> {
     // The worker process holds an exclusive lock. Incomplete jobs keep their transfer IDs
     // and validators; last-good publications stay visible throughout recovery.
@@ -527,22 +613,18 @@ pub async fn run(state: AppState) -> Result<()> {
     let options = settings(&state).await?;
     let mut limits = Arc::new(http::Limits::new(options.concurrency, options.per_host));
     let mut work = FuturesUnordered::new();
-    let mut active_jobs = std::collections::BTreeSet::new();
+    let mut active = BTreeSet::new();
     let mut timer = tokio::time::interval(Duration::from_secs(1));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
-            Some((id,result))=work.next(), if !work.is_empty()=>{active_jobs.remove(&id);result?;},
-            _=timer.tick()=>{
-                sqlx::query("INSERT OR IGNORE INTO jobs(runtime_id) SELECT r.id FROM runtimes r JOIN projects p ON p.id=r.project_id WHERE r.parked_at IS NULL AND p.parked_at IS NULL AND EXISTS(SELECT 1 FROM sources s WHERE s.runtime_id=r.id AND s.enabled=1) AND (r.last_checked IS NULL OR r.last_checked+r.sync_interval<=unixepoch())").execute(&state.db).await?;
-                if work.is_empty() {let options=settings(&state).await?; limits=Arc::new(http::Limits::new(options.concurrency,options.per_host));}
-                while work.len()<4 {
-                    let claimed:Option<(i64,i64)>=sqlx::query_as("UPDATE jobs SET state='running' WHERE id=(SELECT j.id FROM jobs j JOIN runtimes r ON r.id=j.runtime_id JOIN projects p ON p.id=r.project_id WHERE r.parked_at IS NULL AND p.parked_at IS NULL AND j.id NOT IN(SELECT value FROM json_each(?)) AND (j.state='queued' OR (j.state='running' AND EXISTS(SELECT 1 FROM transfers t WHERE t.job_id=j.id AND (t.command IS NOT NULL OR t.state IN('queued','downloading','connecting','verifying') OR (t.state='retrying' AND coalesce(t.retry_at,0)<=unixepoch()))))) ORDER BY j.id LIMIT 1) RETURNING id,runtime_id").bind(serde_json::to_string(&active_jobs)?).fetch_optional(&state.db).await?;
-                    let Some((job,runtime))=claimed else {break};
-                    active_jobs.insert(job);let s=state.clone();let l=limits.clone();
-                    work.push(async move{(job,process(s,runtime,job,l).await)});
-                }
-            }
+        drive_until(&mut work, &mut active, timer.tick()).await?;
+        let tick = schedule_tick(&state, active.clone(), &mut limits);
+        let claims = drive_until(&mut work, &mut active, tick).await??;
+        for (job, runtime) in claims {
+            active.insert(job);
+            let state = state.clone();
+            let limits = limits.clone();
+            work.push(async move { (job, process(state, runtime, job, limits).await) });
         }
     }
 }
@@ -551,6 +633,98 @@ pub async fn run(state: AppState) -> Result<()> {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    async fn scheduler_fixture(path: &std::path::Path) -> Result<AppState> {
+        let state = crate::open(path, "https://mirror.example").await?;
+        sqlx::raw_sql(
+            "INSERT INTO projects(name,slug) VALUES('P','p');
+             INSERT INTO runtimes(project_id,name,slug) VALUES(1,'R','r');
+             INSERT INTO sources(runtime_id,kind,upload) VALUES(1,'upload',X'00');",
+        )
+        .execute(&state.db)
+        .await?;
+        Ok(state)
+    }
+
+    #[tokio::test]
+    async fn scheduling_keeps_polling_the_job_that_holds_the_writer() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = scheduler_fixture(dir.path()).await?;
+        let (held, acquired) = tokio::sync::oneshot::channel();
+        let (started, tick_started) = tokio::sync::oneshot::channel();
+        let mut work = FuturesUnordered::new();
+        let mut active = BTreeSet::from([77]);
+        let write = async {
+            let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+            held.send(()).unwrap();
+            tick_started.await?;
+            // Yield while the scheduler's INSERT waits for this transaction.
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            sqlx::query("UPDATE projects SET name='Committed'")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(())
+        };
+        work.push(async { (77, write.await) });
+        let snapshot = active.clone();
+        let tick = async {
+            acquired.await?;
+            started.send(()).unwrap();
+            schedule_tick(&state, snapshot, &mut Arc::new(http::Limits::new(1, 1))).await
+        };
+        let claims = tokio::time::timeout(
+            Duration::from_secs(3),
+            drive_until(&mut work, &mut active, tick),
+        )
+        .await???;
+        assert_eq!(claims, [(1, 1)]);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT name FROM projects")
+                .fetch_one(&state.db)
+                .await?,
+            "Committed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_scheduler_write_waits_for_the_next_tick() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = scheduler_fixture(dir.path()).await?;
+        let options = state
+            .db
+            .connect_options()
+            .as_ref()
+            .clone()
+            .busy_timeout(Duration::from_millis(30));
+        let scheduler = AppState {
+            db: sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await?,
+            ..state.clone()
+        };
+        let mut limits = Arc::new(http::Limits::new(1, 1));
+        let external_writer = state.db.begin_with("BEGIN IMMEDIATE").await?;
+        assert!(
+            schedule_tick(&scheduler, BTreeSet::new(), &mut limits)
+                .await?
+                .is_empty()
+        );
+        external_writer.rollback().await?;
+        assert_eq!(
+            schedule_tick(&scheduler, BTreeSet::new(), &mut limits).await?,
+            [(1, 1)]
+        );
+        sqlx::query("CREATE TRIGGER stop_job BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT, 'write failed'); END")
+            .execute(&state.db).await?;
+        let error = schedule_tick(&scheduler, BTreeSet::new(), &mut limits)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("write failed"));
+        Ok(())
+    }
 
     async fn job(state: &AppState) -> i64 {
         sqlx::query("INSERT INTO jobs(runtime_id,state) VALUES(1,'running')")
