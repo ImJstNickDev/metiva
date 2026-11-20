@@ -12,7 +12,7 @@ Metiva mirrors artifacts from JSON release feeds. Inspect a feed, start a sync, 
 
 ## Run a mirror
 
-Download the production Compose file into a new directory on a Linux amd64 host. It runs three versioned images and publishes the dashboard and mirror on port **8088**. Run the commands as the account that owns the data.
+Download the production Compose file into a new directory on a Linux amd64 host. It runs three services from two versioned images and publishes the dashboard and mirror on port **8088**. Run the commands as the account that owns the data.
 
 ```sh
 mkdir metiva && cd metiva
@@ -33,7 +33,7 @@ For source builds and deployments on an existing external proxy network, use the
 ## Publish a runtime
 
 1. In **Projects**, create a project and a runtime. Choose visibility explicitly when you want anonymous downloads.
-2. Import a manifest URL or upload JSON. Choose a release list or linked index, select the channels and artifact groups to follow, then preview the exact files and known download size. Edit that selection later to include new platforms or channels.
+2. Import a manifest URL or upload JSON. Select a release list, filter records and inspect a sample. Follow linked documents to the files you want, or use the linked-index picker for channel and platform maps. Preview the files and known download size before saving.
 3. Add the source and start synchronization. **Transfers** shows observed bytes, verification and retries.
 4. Copy the published endpoint from the runtime. Consumers can fetch the manifest at `/p/{project}/r/{runtime}/manifest.json`. A compatible single feed can also provide `upstream.json`.
 5. Select a filename in **Publication** for its revision timeline. A verified correction takes over its existing URL. An administrator can download earlier bytes from the timeline.
@@ -62,7 +62,7 @@ python3 tests/compose/run.py
 
 The Compose test creates a temporary data directory, test origin and TLS proxy. It exercises publication, interrupted transfer recovery, archive access and credential rotation end to end. It requires Docker with Compose v2.24+ and OpenSSL.
 
-Versioned Linux amd64 ingress and service images are published to GHCR and Docker Hub. [Deploy prebuilt images](docs/deployment.md#versioned-images)
+Versioned Linux amd64 ingress and service images are published to GHCR and Docker Hub. [Deploy prebuilt images](docs/deployment.md#versioned-images) · [Changelog](CHANGELOG.md)
 
 The [contributor guide](CONTRIBUTING.md) covers local API, worker and dashboard development.
 
