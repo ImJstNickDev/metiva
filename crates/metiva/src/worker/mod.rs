@@ -1,0 +1,337 @@
+mod adapter;
+mod download;
+mod feed;
+mod http;
+mod integrity;
+
+use crate::{AppState, SourceInput};
+use adapter::{Artifact, Catalog, Mapping};
+use anyhow::{Context, Result, ensure};
+use download::Transfer;
+use feed::{Observation, Source};
+use futures_util::{
+    StreamExt,
+    stream::{self, FuturesUnordered},
+};
+use serde_json::{Value, json};
+use sqlx::Row;
+use std::{sync::Arc, time::Duration};
+use url::Url;
+
+fn mapping(value: Option<Value>) -> Result<Mapping> {
+    value
+        .map(serde_json::from_value)
+        .transpose()
+        .context("invalid mapping")
+        .map(Option::unwrap_or_default)
+}
+
+pub async fn preview(state: &AppState, input: &SourceInput) -> Result<Value> {
+    let source = Source {
+        id: 0,
+        url: input.url.as_deref().map(Url::parse).transpose()?,
+        upload: input.upload.as_ref().map(|v| v.as_bytes().to_vec()),
+        mapping: mapping(input.mapping.clone())?,
+    };
+    let mut catalog = Catalog::new();
+    feed::collect(state, &source, None, false, &mut catalog).await?;
+    Ok(json!({"releases":adapter::releases(&catalog)}))
+}
+
+async fn sources(state: &AppState, runtime: i64) -> Result<Vec<Source>> {
+    let rows = sqlx::query(
+        "SELECT id,url,upload,mapping FROM sources WHERE runtime_id=? AND enabled=1 ORDER BY id",
+    )
+    .bind(runtime)
+    .fetch_all(&state.db)
+    .await?;
+    ensure!(!rows.is_empty(), "runtime has no sources");
+    rows.into_iter()
+        .map(|r| {
+            Ok(Source {
+                id: r.get("id"),
+                url: r
+                    .get::<Option<String>, _>("url")
+                    .as_deref()
+                    .map(Url::parse)
+                    .transpose()?,
+                upload: r.get("upload"),
+                mapping: mapping(
+                    r.get::<Option<String>, _>("mapping")
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()?,
+                )?,
+            })
+        })
+        .collect()
+}
+
+struct Settings {
+    engine: String,
+    retries: u32,
+    concurrency: usize,
+    per_host: usize,
+}
+async fn settings(state: &AppState) -> Result<Settings> {
+    let row = sqlx::query("SELECT engine,retries,concurrency,per_host FROM settings WHERE id=1")
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Settings {
+        engine: row.get("engine"),
+        retries: row.get::<i64, _>("retries").clamp(0, 20) as u32,
+        concurrency: row.get::<i64, _>("concurrency").clamp(1, 64) as usize,
+        per_host: row.get::<i64, _>("per_host").clamp(1, 64) as usize,
+    })
+}
+
+async fn prepare(
+    state: &AppState,
+    job: i64,
+    runtime: i64,
+    release: &str,
+    name: &str,
+    item: &Artifact,
+    engine: &str,
+) -> Result<i64> {
+    let url = item.url.as_str();
+    let size = item.size.map(|s| s as i64);
+    let host = item.url.host_str().context("missing artifact host")?;
+    let row=sqlx::query("INSERT INTO transfers(job_id,runtime_id,release,filename,host,backend,state,source_url,expected_size,expected_digest,total) VALUES(?,?,?,?,?,?,'queued',?,?,?,?) ON CONFLICT(job_id,release,filename) DO UPDATE SET backend=excluded.backend RETURNING id,source_url,expected_size,expected_digest").bind(job).bind(runtime).bind(release).bind(name).bind(host).bind(engine).bind(url).bind(size).bind(&item.sha256).bind(size).fetch_one(&state.db).await?;
+    ensure!(
+        row.get::<String, _>("source_url") == url
+            && row.get::<Option<i64>, _>("expected_size") == size
+            && row.get::<Option<String>, _>("expected_digest") == item.sha256,
+        "source changed during transfer recovery; start a fresh sync"
+    );
+    let id: i64 = row.get("id");
+    // Adopt only a stopped transfer with the same identity and expectations.
+    let path = state.data.join("staging").join(format!("{id}.part"));
+    if !tokio::fs::try_exists(&path).await? {
+        let old=sqlx::query("SELECT t.id,t.validator,t.effective_url FROM transfers t JOIN jobs j ON j.id=t.job_id WHERE t.id<>? AND t.runtime_id=? AND t.release=? AND t.filename=? AND t.source_url=? AND t.expected_size IS ? AND t.expected_digest IS ? AND j.state='failed' ORDER BY t.id DESC LIMIT 1").bind(id).bind(runtime).bind(release).bind(name).bind(url).bind(size).bind(&item.sha256).fetch_optional(&state.db).await?;
+        if let Some(old) = old {
+            let old_path = state
+                .data
+                .join("staging")
+                .join(format!("{}.part", old.get::<i64, _>("id")));
+            if tokio::fs::try_exists(&old_path).await? {
+                // Record the validator first. A crash before rename safely restarts adoption.
+                sqlx::query("UPDATE transfers SET validator=?,effective_url=? WHERE id=?")
+                    .bind(old.get::<Option<String>, _>("validator"))
+                    .bind(old.get::<Option<String>, _>("effective_url"))
+                    .bind(id)
+                    .execute(&state.db)
+                    .await?;
+                tokio::fs::rename(old_path, path).await?;
+            }
+        }
+    }
+    Ok(id)
+}
+
+struct Candidate {
+    catalog: Catalog,
+    observations: Vec<Observation>,
+    mirror: Catalog,
+    upstream: Option<String>,
+}
+
+async fn publish(
+    state: &AppState,
+    runtime: i64,
+    job: i64,
+    active: Option<i64>,
+    project: &str,
+    slug: &str,
+    candidate: Candidate,
+) -> Result<()> {
+    let manifest=json!({"schema_version":1,"project":project,"runtime":slug,"releases":adapter::releases(&candidate.mirror)}).to_string();
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let old = sqlx::query("SELECT manifest,upstream FROM publications WHERE id=?")
+        .bind(active)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let old_digests:Vec<(i64,String)>=sqlx::query_as("SELECT o.source_id,o.digest FROM publication_sources ps JOIN source_observations o ON o.id=ps.observation_id WHERE ps.publication_id=? ORDER BY o.source_id,o.page").bind(active).fetch_all(&mut *tx).await?;
+    let unchanged = old.is_some_and(|o| {
+        o.get::<String, _>("manifest") == manifest
+            && o.get::<Option<String>, _>("upstream") == candidate.upstream
+    }) && old_digests
+        .iter()
+        .map(|(id, d)| (*id, d))
+        .eq(candidate.observations.iter().map(|o| (o.source, &o.digest)));
+    let publication = if unchanged {
+        active.context("missing active publication")?
+    } else {
+        let publication =
+            sqlx::query("INSERT INTO publications(runtime_id,manifest,upstream) VALUES(?,?,?)")
+                .bind(runtime)
+                .bind(manifest)
+                .bind(candidate.upstream)
+                .execute(&mut *tx)
+                .await?
+                .last_insert_rowid();
+        for ((release, filename), item) in &candidate.mirror.assets {
+            let source = &candidate.catalog.assets[&(release.clone(), filename.clone())];
+            sqlx::query("INSERT INTO files(publication_id,release,filename,source_url,digest,size) VALUES(?,?,?,?,?,?)").bind(publication).bind(release).bind(filename).bind(source.url.as_str()).bind(item.sha256.as_deref().context("missing verified digest")?).bind(item.size.context("missing verified size")? as i64).execute(&mut *tx).await?;
+        }
+        for obs in candidate.observations {
+            sqlx::query(
+                "INSERT INTO publication_sources(publication_id,observation_id) VALUES(?,?)",
+            )
+            .bind(publication)
+            .bind(obs.id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        publication
+    };
+    let switched=sqlx::query("UPDATE runtimes SET active_publication=?,last_success=unixepoch(),last_checked=unixepoch() WHERE id=? AND active_publication IS ?").bind(publication).bind(runtime).bind(active).execute(&mut *tx).await?;
+    ensure!(
+        switched.rows_affected() == 1,
+        "active publication changed during synchronization"
+    );
+    sqlx::query("UPDATE jobs SET state='completed',finished_at=unixepoch(),error=NULL WHERE id=?")
+        .bind(job)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE transfers SET state='cancelled',command=NULL,speed=0,error='Removed from recovered candidate' WHERE job_id=? AND state NOT IN ('completed','failed','cancelled')").bind(job).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn sync(state: &AppState, runtime: i64, job: i64, limits: Arc<http::Limits>) -> Result<()> {
+    let row=sqlx::query("SELECT p.slug AS project,r.slug,r.active_publication FROM runtimes r JOIN projects p ON p.id=r.project_id WHERE r.id=?").bind(runtime).fetch_one(&state.db).await?;
+    let project: String = row.get("project");
+    let slug: String = row.get("slug");
+    let active: Option<i64> = row.get("active_publication");
+    let inputs = sources(state, runtime).await?;
+    let (catalog, mut observations) = feed::observe(state, &inputs, job, true).await?;
+    let previous: Vec<(String, String)> =
+        sqlx::query_as("SELECT release,filename FROM files WHERE publication_id=?")
+            .bind(active)
+            .fetch_all(&state.db)
+            .await?;
+    if previous.iter().any(|key| !catalog.assets.contains_key(key)) {
+        let (confirmation, checked) = feed::observe(state, &inputs, job, false).await?;
+        ensure!(
+            catalog == confirmation,
+            "independent source check disagreed with proposed removals"
+        );
+        observations = checked;
+    }
+    let options = settings(state).await?;
+    let mut transfers = Vec::with_capacity(catalog.assets.len());
+    for ((release, name), item) in &catalog.assets {
+        let id = prepare(state, job, runtime, release, name, item, &options.engine).await?;
+        transfers.push((
+            (release.clone(), name.clone()),
+            Transfer {
+                id,
+                filename: name.clone(),
+                item: item.clone(),
+                curl: options.engine == "curl",
+                retries: options.retries,
+                limits: limits.clone(),
+            },
+        ));
+    }
+    let mut pending = stream::iter(transfers)
+        .map(|(key, task)| async move {
+            let result = task.run(state).await;
+            (key, result)
+        })
+        .buffer_unordered((options.concurrency * 2).clamp(2, 64));
+    let mut mirror = catalog.clone();
+    while let Some(((release, name), result)) = pending.next().await {
+        let (digest, size) = result.with_context(|| format!("artifact {release}/{name}"))?;
+        let mut url = Url::parse(&state.public_url)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid public origin"))?
+            .clear()
+            .extend(["p", &project, "r", &slug, "files", &release, &name]);
+        let asset = mirror
+            .assets
+            .get_mut(&(release, name))
+            .context("candidate identity disappeared")?;
+        asset.url = url;
+        asset.sha256 = Some(digest);
+        asset.size = Some(size);
+    }
+    let upstream = if inputs.len() == 1 && observations.len() == 1 {
+        let row=sqlx::query("SELECT d.body,o.url FROM source_observations o JOIN raw_documents d ON d.digest=o.digest WHERE o.id=?").bind(observations[0].id).fetch_one(&state.db).await?;
+        let base = row
+            .get::<Option<String>, _>("url")
+            .as_deref()
+            .map(Url::parse)
+            .transpose()?;
+        adapter::rewrite(
+            &row.get::<Vec<u8>, _>("body"),
+            &inputs[0].mapping,
+            base.as_ref(),
+            &mirror,
+        )
+        .map(|v| v.to_string())
+    } else {
+        None
+    };
+    publish(
+        state,
+        runtime,
+        job,
+        active,
+        &project,
+        &slug,
+        Candidate {
+            catalog,
+            observations,
+            mirror,
+            upstream,
+        },
+    )
+    .await
+}
+
+async fn process(state: AppState, runtime: i64, job: i64, limits: Arc<http::Limits>) -> Result<()> {
+    if let Err(error) = sync(&state, runtime, job, limits).await {
+        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("UPDATE jobs SET state='failed',finished_at=unixepoch(),error=? WHERE id=?")
+            .bind(format!("{error:#}"))
+            .bind(job)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE runtimes SET last_checked=unixepoch() WHERE id=?")
+            .bind(runtime)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE transfers SET state='cancelled',command=NULL,speed=0,retry_at=NULL,error='Synchronization stopped' WHERE job_id=? AND state NOT IN('completed','failed','cancelled')").bind(job).execute(&mut *tx).await?;
+        tx.commit().await?;
+    }
+    Ok(())
+}
+
+pub async fn run(state: AppState) -> Result<()> {
+    // The worker process holds an exclusive lock. Incomplete jobs keep their transfer IDs
+    // and validators; last-good publications stay visible throughout recovery.
+    sqlx::query("UPDATE jobs SET state='queued' WHERE state='running'")
+        .execute(&state.db)
+        .await?;
+    let options = settings(&state).await?;
+    let mut limits = Arc::new(http::Limits::new(options.concurrency, options.per_host));
+    let mut work = FuturesUnordered::new();
+    let mut timer = tokio::time::interval(Duration::from_secs(1));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            Some(result)=work.next(), if !work.is_empty()=>result?,
+            _=timer.tick()=>{
+                sqlx::query("INSERT OR IGNORE INTO jobs(runtime_id) SELECT r.id FROM runtimes r WHERE EXISTS(SELECT 1 FROM sources s WHERE s.runtime_id=r.id AND s.enabled=1) AND (r.last_checked IS NULL OR r.last_checked+r.sync_interval<=unixepoch())").execute(&state.db).await?;
+                if work.is_empty() {let options=settings(&state).await?; limits=Arc::new(http::Limits::new(options.concurrency,options.per_host));}
+                while work.len()<4 {
+                    let claimed:Option<(i64,i64)>=sqlx::query_as("UPDATE jobs SET state='running' WHERE id=(SELECT id FROM jobs WHERE state='queued' ORDER BY id LIMIT 1) RETURNING id,runtime_id").fetch_optional(&state.db).await?;
+                    let Some((job,runtime))=claimed else {break};
+                    work.push(process(state.clone(),runtime,job,limits.clone()));
+                }
+            }
+        }
+    }
+}
