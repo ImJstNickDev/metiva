@@ -5,6 +5,7 @@ mod download;
 mod feed;
 mod http;
 mod integrity;
+pub(crate) mod inventory;
 
 use crate::{AppState, SourceInput};
 use adapter::{Artifact, Catalog, ManifestAdapter, Mapping};

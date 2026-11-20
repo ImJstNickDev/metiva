@@ -566,11 +566,7 @@ pub(crate) async fn collect(
         };
         let local = walk.accept(target, &page, &source.mapping, None, None)?;
         if let Some(observation) = observation {
-            let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
-            for ((version, name), item) in &local.assets {
-                sqlx::query("INSERT INTO observation_artifacts(observation_id,release,filename,source_url,metadata) VALUES(?,?,?,?,?)").bind(observation.id).bind(version).bind(name).bind(item.url.as_str()).bind(serde_json::to_string(item)?).execute(&mut *tx).await?;
-            }
-            tx.commit().await?;
+            super::inventory::record(&state.db, observation.id, &local).await?;
             observations.push(observation);
         }
         adapter::merge(catalog, local)?;
