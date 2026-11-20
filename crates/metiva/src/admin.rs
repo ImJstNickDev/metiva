@@ -327,7 +327,13 @@ async fn check_source(s: &AppState, id: i64, c: &SourceInput) -> Result<Value, A
     if c.url.is_some() == c.upload.is_some() {
         return Err(bad("Supply one manifest URL or uploaded JSON document"));
     }
-    worker::preview(s, c).await.map_err(|e| bad(&e.to_string()))
+    worker::preview(s, c).await.map_err(|e| {
+        let mut message = format!("{e:#}");
+        if c.mapping.is_none() && message.contains("missing artifacts for release") {
+            message.push_str(". Inspect the manifest to choose a linked index or a release list, or set a manual field mapping.");
+        }
+        bad(&message)
+    })
 }
 async fn preview(
     State(s): State<AppState>,
