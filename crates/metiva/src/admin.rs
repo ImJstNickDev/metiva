@@ -1,3 +1,6 @@
+mod parking;
+mod timeline;
+
 use crate::{AppState, SourceInput, worker};
 use axum::{
     Extension, Json, Router,
@@ -24,7 +27,10 @@ use std::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/admin/projects", get(projects).post(create_project))
-        .route("/api/admin/projects/{id}", patch(update_project))
+        .route(
+            "/api/admin/projects/{id}",
+            get(project).patch(update_project),
+        )
         .route(
             "/api/admin/projects/{id}/runtimes",
             get(runtimes).post(create_runtime),
@@ -33,6 +39,7 @@ pub fn router() -> Router<AppState> {
             "/api/admin/runtimes/{id}",
             get(runtime).patch(update_runtime),
         )
+        .route("/api/admin/runtimes/{id}/past-files", get(past_files))
         .route("/api/admin/runtimes/{id}/preview", post(preview))
         .route("/api/admin/runtimes/{id}/sources", post(add_source))
         .route(
@@ -44,7 +51,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/transfers/{id}", get(transfer_history))
         .route("/api/admin/transfers/{id}/{action}", post(control))
         .route("/api/admin/events", get(events))
-        .route("/api/admin/archive", get(archive))
+        .merge(parking::router())
+        .merge(timeline::router())
+        .merge(worker::selection_router())
         .route("/api/admin/originals/{id}", get(original))
         .route("/api/admin/overview", get(overview))
         .route("/api/admin/settings", get(settings).patch(update_settings))
@@ -106,19 +115,34 @@ fn records(rows: Vec<SqliteRow>) -> Value {
     Value::Array(rows.into_iter().map(record).collect())
 }
 
-async fn projects(State(s): State<AppState>) -> ResultJson {
-    let rows=sqlx::query(
+macro_rules! project_query {
+    ($filter:literal) => { concat!(
         "SELECT p.*,count(r.id) runtime_count,max(r.last_success) last_success,
-         CASE WHEN max(j.state='running') THEN 'running'
+         CASE WHEN p.parked_at IS NOT NULL THEN 'parked'
+              WHEN max(j.state='running') THEN 'running'
               WHEN max(j.state='queued') THEN 'queued'
               WHEN max(j.state='failed') THEN 'attention'
               WHEN max(r.last_success) IS NOT NULL THEN 'ready'
               ELSE 'idle' END status
-         FROM projects p LEFT JOIN runtimes r ON r.project_id=p.id
+         FROM projects p LEFT JOIN runtimes r ON r.project_id=p.id AND r.parked_at IS NULL
          LEFT JOIN jobs j ON j.id=(SELECT max(latest.id) FROM jobs latest WHERE latest.runtime_id=r.id)
-         GROUP BY p.id ORDER BY p.name,p.id"
-    ).fetch_all(&s.db).await?;
-    Ok(Json(records(rows)))
+         WHERE ", $filter, " GROUP BY p.id ORDER BY p.name,p.id"
+    )};
+}
+async fn projects(State(s): State<AppState>) -> ResultJson {
+    Ok(Json(records(
+        sqlx::query(project_query!("p.parked_at IS NULL"))
+            .fetch_all(&s.db)
+            .await?,
+    )))
+}
+async fn project(State(s): State<AppState>, Path(id): Path<i64>) -> ResultJson {
+    Ok(Json(record(
+        sqlx::query(project_query!("p.id=?"))
+            .bind(id)
+            .fetch_one(&s.db)
+            .await?,
+    )))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -216,7 +240,7 @@ async fn runtimes(State(s): State<AppState>, Path(id): Path<i64>) -> ResultJson 
         .bind(id)
         .fetch_one(&s.db)
         .await?;
-    Ok(Json(records(sqlx::query("SELECT r.*, COALESCE((SELECT state FROM jobs WHERE runtime_id=r.id ORDER BY id DESC LIMIT 1),'idle') status FROM runtimes r WHERE project_id=? ORDER BY r.name,r.id").bind(id).fetch_all(&s.db).await?)))
+    Ok(Json(records(sqlx::query("SELECT r.*, COALESCE((SELECT state FROM jobs WHERE runtime_id=r.id ORDER BY id DESC LIMIT 1),'idle') status FROM runtimes r WHERE project_id=? AND r.parked_at IS NULL ORDER BY r.name,r.id").bind(id).fetch_all(&s.db).await?)))
 }
 async fn create_runtime(
     State(s): State<AppState>,
@@ -232,7 +256,7 @@ async fn create_runtime(
     if let Some(i) = c.sync_interval {
         interval(i)?
     }
-    Ok(Json(record(sqlx::query("INSERT INTO runtimes(project_id,name,slug,visibility,sync_interval) VALUES(?,?,?,?,COALESCE(?,(SELECT sync_interval FROM settings))) RETURNING *").bind(id).bind(c.name.trim()).bind(c.slug).bind(vis).bind(c.sync_interval).fetch_one(&s.db).await?)))
+    Ok(Json(record(sqlx::query("INSERT INTO runtimes(project_id,name,slug,visibility,sync_interval) SELECT id,?,?,?,COALESCE(?,(SELECT sync_interval FROM settings)) FROM projects WHERE id=? AND parked_at IS NULL RETURNING *").bind(c.name.trim()).bind(c.slug).bind(vis).bind(c.sync_interval).bind(id).fetch_one(&s.db).await?)))
 }
 async fn update_runtime(
     State(s): State<AppState>,
@@ -250,8 +274,36 @@ async fn update_runtime(
     }
     Ok(Json(record(sqlx::query("UPDATE runtimes SET visibility=coalesce(?,visibility),sync_interval=coalesce(?,sync_interval) WHERE id=? RETURNING *").bind(c.visibility).bind(c.sync_interval).bind(id).fetch_one(&s.db).await?)))
 }
+// v0.1.0 publications could retire an entire identity. Keep these older objects
+// reachable from the administrator's runtime without adding them to the mirror.
+macro_rules! past_files_query {
+    ($select:literal, $tail:literal) => { concat!($select,
+        " FROM files f JOIN publications pub ON pub.id=f.publication_id
+          JOIN runtimes r ON r.id=pub.runtime_id
+          WHERE r.id=? AND NOT EXISTS(SELECT 1 FROM files live WHERE live.publication_id=r.active_publication
+            AND live.release=f.release AND live.filename=f.filename)", $tail) };
+}
+#[derive(Deserialize)]
+struct FilePage {
+    before: Option<i64>,
+}
+async fn past_files(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Query(page): Query<FilePage>,
+) -> ResultJson {
+    let mut rows = sqlx::query(past_files_query!(
+        "SELECT f.id,f.release,f.filename,f.digest,f.size,f.source_url,pub.created_at",
+        " AND f.id < ? AND f.id=(SELECT max(previous.id) FROM files previous JOIN publications snapshot ON snapshot.id=previous.publication_id
+          WHERE snapshot.runtime_id=r.id AND previous.release=f.release AND previous.filename=f.filename AND previous.digest=f.digest)
+          ORDER BY f.id DESC LIMIT 51"
+    )).bind(id).bind(page.before.unwrap_or(i64::MAX)).fetch_all(&s.db).await?;
+    let next = (rows.len() > 50).then(|| rows[49].get::<i64, _>("id"));
+    rows.truncate(50);
+    Ok(Json(json!({"files": records(rows),"next_before":next})))
+}
 async fn runtime(State(s): State<AppState>, Path(id): Path<i64>) -> ResultJson {
-    let mut item=record(sqlx::query("SELECT r.*,p.slug project_slug,p.visibility project_visibility,COALESCE((SELECT state FROM jobs WHERE runtime_id=r.id ORDER BY id DESC LIMIT 1),'idle') status,pub.upstream IS NOT NULL has_upstream,pub.manifest FROM runtimes r JOIN projects p ON p.id=r.project_id LEFT JOIN publications pub ON pub.id=r.active_publication WHERE r.id=?").bind(id).fetch_one(&s.db).await?);
+    let mut item=record(sqlx::query("SELECT r.*,p.slug project_slug,p.visibility project_visibility,p.parked_at project_parked_at,COALESCE((SELECT state FROM jobs WHERE runtime_id=r.id ORDER BY id DESC LIMIT 1),'idle') status,pub.upstream IS NOT NULL has_upstream,pub.manifest FROM runtimes r JOIN projects p ON p.id=r.project_id LEFT JOIN publications pub ON pub.id=r.active_publication WHERE r.id=?").bind(id).fetch_one(&s.db).await?);
     item["manifest"] = item["manifest"]
         .as_str()
         .and_then(|v| serde_json::from_str(v).ok())
@@ -261,14 +313,17 @@ async fn runtime(State(s): State<AppState>, Path(id): Path<i64>) -> ResultJson {
     let publication = item["active_publication"].as_i64().unwrap_or(-1);
     item["current_files"] = files(&s, publication).await?;
     item["originals"] = originals(&s, publication).await?;
-    item["history"]=records(sqlx::query("SELECT id,state,created_at,finished_at,error FROM jobs WHERE runtime_id=? ORDER BY id DESC LIMIT 100").bind(id).fetch_all(&s.db).await?);
+    item["has_past_files"] = json!(
+        sqlx::query_scalar::<_, bool>(past_files_query!("SELECT EXISTS(SELECT 1", ")"))
+            .bind(id)
+            .fetch_one(&s.db)
+            .await?
+    );
+    item["history"]=records(sqlx::query("SELECT id,state,created_at,finished_at,error,verified_releases,failed_releases FROM jobs WHERE runtime_id=? ORDER BY id DESC LIMIT 100").bind(id).fetch_all(&s.db).await?);
     Ok(Json(item))
 }
 async fn check_source(s: &AppState, id: i64, c: &SourceInput) -> Result<Value, ApiError> {
-    sqlx::query("SELECT id FROM runtimes WHERE id=?")
-        .bind(id)
-        .fetch_one(&s.db)
-        .await?;
+    parking::require_available(&mut *s.db.acquire().await?, id).await?;
     if c.url.is_some() == c.upload.is_some() {
         return Err(bad("Supply one manifest URL or uploaded JSON document"));
     }
@@ -293,6 +348,7 @@ async fn require_idle(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     runtime: i64,
 ) -> Result<(), ApiError> {
+    parking::require_available(tx, runtime).await?;
     let busy: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM jobs WHERE runtime_id=? AND state='running')",
     )
@@ -379,6 +435,7 @@ async fn queue_sync(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     runtime: i64,
 ) -> Result<(), ApiError> {
+    parking::require_available(tx, runtime).await?;
     let ready:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sources WHERE runtime_id=r.id AND enabled=1) FROM runtimes r WHERE r.id=?")
         .bind(runtime).fetch_one(&mut **tx).await?;
     if !ready {
@@ -424,6 +481,7 @@ async fn transfer_history(State(s): State<AppState>, Path(id): Path<i64>) -> Res
 async fn control(State(s): State<AppState>, Path((id, action)): Path<(i64, String)>) -> ResultJson {
     let mut tx = s.db.begin_with("BEGIN IMMEDIATE").await?;
     let row=sqlx::query("SELECT t.state,t.runtime_id,t.command,j.state job_state FROM transfers t JOIN jobs j ON j.id=t.job_id WHERE t.id=?").bind(id).fetch_one(&mut *tx).await?;
+    parking::require_available(&mut tx, row.get("runtime_id")).await?;
     let state = row.get::<String, _>("state");
     if row
         .get::<Option<String>, _>("command")
@@ -491,21 +549,6 @@ async fn events(State(s): State<AppState>, headers: axum::http::HeaderMap) -> im
     );
     Sse::new(snapshots).keep_alive(KeepAlive::default())
 }
-#[derive(Deserialize)]
-struct ArchivePage {
-    before: Option<i64>,
-}
-async fn archive(State(s): State<AppState>, Query(page): Query<ArchivePage>) -> ResultJson {
-    let mut rows = Vec::new();
-    for row in sqlx::query("SELECT pub.id,p.id project_id,r.id runtime_id,p.name project,r.name runtime,pub.created_at,pub.manifest FROM publications pub JOIN runtimes r ON r.id=pub.runtime_id JOIN projects p ON p.id=r.project_id WHERE pub.id IS NOT r.active_publication AND (? IS NULL OR pub.id < ?) ORDER BY pub.id DESC LIMIT 100").bind(page.before).bind(page.before).fetch_all(&s.db).await? {
-        let id:i64=row.get("id");let mut item=record(row);
-        item["manifest"]=serde_json::from_str(item["manifest"].as_str().unwrap_or("null")).unwrap_or_default();
-        item["files"]=files(&s,id).await?;item["originals"]=originals(&s,id).await?;
-        rows.push(item)
-    }
-    Ok(Json(json!(rows)))
-}
-
 struct Usage {
     modified: SystemTime,
     scanned: Instant,
@@ -568,7 +611,7 @@ impl Storage {
     }
 }
 async fn overview(State(s): State<AppState>, Extension(storage): Extension<Storage>) -> ResultJson {
-    let mut item=record(sqlx::query("SELECT (SELECT COUNT(*) FROM projects) projects,(SELECT COUNT(*) FROM runtimes) runtimes,(SELECT COUNT(*) FROM transfers WHERE state IN ('connecting','downloading','verifying')) active,(SELECT COUNT(*) FROM transfers WHERE state='queued') queued,(SELECT MAX(last_success) FROM runtimes) last_success,(SELECT COUNT(DISTINCT r.project_id) FROM runtimes r WHERE (SELECT state FROM jobs WHERE runtime_id=r.id ORDER BY id DESC LIMIT 1)='failed') attention,engine FROM settings").fetch_one(&s.db).await?);
+    let mut item=record(sqlx::query("SELECT (SELECT COUNT(*) FROM projects WHERE parked_at IS NULL) projects,(SELECT COUNT(*) FROM available_runtimes) runtimes,(SELECT COUNT(*) FROM transfers WHERE state IN ('connecting','downloading','verifying')) active,(SELECT COUNT(*) FROM transfers WHERE state='queued') queued,(SELECT MAX(last_success) FROM available_runtimes) last_success,(SELECT COUNT(DISTINCT r.project_id) FROM available_runtimes r WHERE (SELECT state FROM jobs WHERE runtime_id=r.id ORDER BY id DESC LIMIT 1)='failed') attention,engine FROM settings").fetch_one(&s.db).await?);
     item["storage_bytes"] = json!(storage.bytes(s.data.join("artifacts")).await?);
     item["activity"]=records(sqlx::query("SELECT j.id,p.name project,r.name runtime,j.state,j.created_at,j.error FROM jobs j JOIN runtimes r ON r.id=j.runtime_id JOIN projects p ON p.id=r.project_id ORDER BY j.id DESC LIMIT 30").fetch_all(&s.db).await?);
     Ok(Json(item))
