@@ -99,7 +99,8 @@ async fn issue(tx: &mut Transaction<'_, Sqlite>, input: NewKey) -> Result<Issued
             ));
         }
     };
-    let raw = token("mtv_");
+    // Four bytes identify the key in the dashboard. The private suffix retains 256 bits.
+    let raw = token::<36>("mtv_");
     let metadata=sqlx::query_as("INSERT INTO api_keys(name,prefix,digest,scope,project_id,runtime_id) VALUES(?,?,?,?,?,?) RETURNING *")
         .bind(name).bind(&raw[..12]).bind(digest(&raw)).bind(input.scope).bind(project).bind(input.runtime_id).fetch_one(&mut **tx).await?;
     Ok(Issued {

@@ -75,14 +75,14 @@ fn create_secret(dir: &Path) -> anyhow::Result<()> {
         load_secret(&path)?;
         return Ok(());
     }
-    let temp: PathBuf = dir.join(token(".bootstrap-"));
+    let temp: PathBuf = dir.join(token::<32>(".bootstrap-"));
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .open(&temp)?;
     let install = (|| -> anyhow::Result<()> {
-        writeln!(file, "{}", token("mtb_"))?;
+        writeln!(file, "{}", token::<32>("mtb_"))?;
         file.sync_all()?;
         match fs::hard_link(&temp, &path) {
             Ok(()) => Ok(()),
@@ -323,7 +323,7 @@ async fn new_session(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     username: &str,
 ) -> Result<Response> {
-    let raw = token("mts_");
+    let raw = token::<32>("mts_");
     sqlx::query("DELETE FROM admin_sessions WHERE expires_at<=unixepoch()")
         .execute(&mut **tx)
         .await?;

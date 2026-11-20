@@ -91,8 +91,8 @@ fn missing() -> Error {
     Error(StatusCode::NOT_FOUND, "Resource not found")
 }
 
-fn token(prefix: &str) -> String {
-    let mut bytes = [0u8; 32];
+fn token<const N: usize>(prefix: &str) -> String {
+    let mut bytes = [0u8; N];
     OsRng.fill_bytes(&mut bytes);
     format!("{prefix}{}", hex::encode(bytes))
 }
@@ -111,7 +111,9 @@ fn bearer(headers: &HeaderMap) -> Result<Option<&str>> {
         .ok()
         .and_then(|s| s.split_once(' '))
         .filter(|(scheme, raw)| {
-            scheme.eq_ignore_ascii_case("Bearer") && raw.starts_with("mtv_") && raw.len() == 68
+            scheme.eq_ignore_ascii_case("Bearer")
+                && raw.starts_with("mtv_")
+                && matches!(raw.len(), 68 | 76)
         })
         .map(|(_, raw)| raw);
     if values.next().is_some() || value.is_none() {
