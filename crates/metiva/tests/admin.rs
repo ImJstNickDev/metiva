@@ -176,12 +176,20 @@ async fn validate_requests_replace_sources_and_retain_originals() {
         job,
         d.call(Method::POST, &format!("{rt}/sync"), None, 200).await
     );
+    assert_eq!(
+        d.call(Method::GET, "projects", None, 200).await[0]["status"],
+        "queued"
+    );
     let job = job["id"].as_i64().unwrap();
     sqlx::query("UPDATE jobs SET state='running' WHERE id=?")
         .bind(job)
         .execute(&d.state.db)
         .await
         .unwrap();
+    assert_eq!(
+        d.call(Method::GET, "projects", None, 200).await[0]["status"],
+        "running"
+    );
     let source = format!("sources/{old}");
     d.call(Method::PATCH, &source, Some(upload("1.1")), 409)
         .await;

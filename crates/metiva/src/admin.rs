@@ -107,7 +107,18 @@ fn records(rows: Vec<SqliteRow>) -> Value {
 }
 
 async fn projects(State(s): State<AppState>) -> ResultJson {
-    Ok(Json(records(sqlx::query("SELECT p.*,COUNT(r.id) runtime_count,MAX(r.last_success) last_success,CASE WHEN EXISTS(SELECT 1 FROM jobs j JOIN runtimes rt ON rt.id=j.runtime_id WHERE rt.project_id=p.id AND j.state='failed' AND j.id=(SELECT MAX(j2.id) FROM jobs j2 WHERE j2.runtime_id=rt.id)) THEN 'attention' WHEN MAX(r.last_success) IS NOT NULL THEN 'ready' ELSE 'idle' END status FROM projects p LEFT JOIN runtimes r ON r.project_id=p.id GROUP BY p.id ORDER BY p.name,p.id").fetch_all(&s.db).await?)))
+    let rows=sqlx::query(
+        "SELECT p.*,count(r.id) runtime_count,max(r.last_success) last_success,
+         CASE WHEN max(j.state='running') THEN 'running'
+              WHEN max(j.state='queued') THEN 'queued'
+              WHEN max(j.state='failed') THEN 'attention'
+              WHEN max(r.last_success) IS NOT NULL THEN 'ready'
+              ELSE 'idle' END status
+         FROM projects p LEFT JOIN runtimes r ON r.project_id=p.id
+         LEFT JOIN jobs j ON j.id=(SELECT max(latest.id) FROM jobs latest WHERE latest.runtime_id=r.id)
+         GROUP BY p.id ORDER BY p.name,p.id"
+    ).fetch_all(&s.db).await?;
+    Ok(Json(records(rows)))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
