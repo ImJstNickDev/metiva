@@ -3,6 +3,7 @@ import fcntl
 import json
 import socket
 import struct
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -13,6 +14,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
     fcntl.ioctl(sock, 0x8916, packed)  # SIOCSIFADDR
     mask = packed[:20] + b"\xff" * 4 + packed[24:]
     fcntl.ioctl(sock, 0x891c, mask)  # SIOCSIFNETMASK
+
+config_lock = threading.Lock()
 
 class Origin(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -25,10 +28,12 @@ class Origin(BaseHTTPRequestHandler):
         if not filename or not (root / filename).exists():
             self.send_error(404)
             return
-        config = json.loads((root / "behavior.json").read_text())
-        if self.path in config:
-            behavior = config.pop(self.path)
-            (root / "behavior.json").write_text(json.dumps(config))
+        with config_lock:
+            config = json.loads((root / "behavior.json").read_text())
+            behavior = config.pop(self.path, None)
+            if behavior:
+                (root / "behavior.json").write_text(json.dumps(config))
+        if behavior:
             self.send_response(behavior)
             self.send_header("Retry-After", "1")
             self.end_headers()

@@ -12,7 +12,7 @@ async fn shutdown() {
 fn validate_limits() -> Result<()> {
     for (name, max) in [
         ("METIVA_CONNECT_TIMEOUT_SECS", 3600),
-        ("METIVA_IDLE_TIMEOUT_SECS", 86400),
+        ("METIVA_IDLE_TIMEOUT_SECS", 3600),
         ("METIVA_MAX_ARTIFACT_BYTES", i64::MAX as u64),
     ] {
         if let Ok(text) = env::var(name) {

@@ -8,7 +8,7 @@ import secrets
 import ssl
 import sys
 import time
-from urllib.parse import urlsplit
+
 
 ROOT = Path("/fixture")
 ORIGIN = "http://93.184.216.34:8081"
@@ -134,9 +134,24 @@ elif sys.argv[1]=="mirror":
     request(published,key=runtime["token"],status=(401,))
     state["key"]=new["token"]
     request("/api/admin/projects",key=new["token"],status=(401,))
+    # Conditional 304 pages must reconstruct the complete active publication.
+    runtime_view = lambda: admin(f"runtimes/{state['runtime']}")
+    original_id = runtime_view()["active_publication"]
+    sync()
+    assert runtime_view()["active_publication"] == original_id
+    (ROOT/"source.json").rename(ROOT/"outage.json")
+    sync("failed")
+    assert runtime_view()["active_publication"] == original_id
+    (ROOT/"outage.json").rename(ROOT/"source.json")
+    # Exercise the alternate downloader on a new physical object.
+    admin("settings","PATCH",{"engine":"curl","concurrency":2,"per_host":2,"retries":0,"sync_interval":3600})
     manifest(["gamma.bin"],broken=True)
     sync("failed")
     assert request(published,key=state["key"])==current
+    manifest(["gamma.bin","beta.bin"])
+    sync()
+    assert any(t["backend"]=="curl" and t["filename"]=="gamma.bin" and t["state"]=="completed"
+               for t in admin("transfers"))
     manifest(["beta.bin"])
     sync()
     request(alpha,key=state["key"],status=(404,))
