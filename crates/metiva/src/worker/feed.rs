@@ -147,7 +147,6 @@ async fn remote(
             }
         }
     }
-    let validators = headers.contains_key(IF_NONE_MATCH) || headers.contains_key(IF_MODIFIED_SINCE);
     let mut retries = 0;
     let response = loop {
         let fetched =
@@ -174,16 +173,17 @@ async fn remote(
         retries += 1;
     };
     if response.status == StatusCode::NOT_MODIFIED {
-        ensure!(validators, "unsolicited 304 without a conditional request");
         let row = cached.context("unexpected 304 without a previous observation")?;
         ensure!(
             row.get::<Option<String>, _>("url").as_deref() == Some(response.url.as_str()),
             "304 from changed destination"
         );
-        let bytes = sqlx::query_scalar("SELECT body FROM raw_documents WHERE digest=?")
-            .bind(row.get::<String, _>("digest"))
+        let digest: &str = row.get("digest");
+        let bytes: Vec<u8> = sqlx::query_scalar("SELECT body FROM raw_documents WHERE digest=?")
+            .bind(digest)
             .fetch_one(&state.db)
             .await?;
+        verify_body(&bytes, digest)?;
         return Ok(Page {
             bytes,
             url: Some(response.url),
@@ -208,6 +208,69 @@ async fn remote(
         modified,
         link,
     })
+}
+
+#[derive(Debug)]
+struct InvalidCapture;
+impl std::fmt::Display for InvalidCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid captured manifest body")
+    }
+}
+impl std::error::Error for InvalidCapture {}
+
+fn verify_body(bytes: &[u8], digest: &str) -> Result<()> {
+    ensure!(
+        bytes.len() <= PAGE_BYTES && hex::encode(Sha256::digest(bytes)) == digest,
+        InvalidCapture
+    );
+    Ok(())
+}
+
+/// Before a transfer plan exists, page zero identifies the captured traversal.
+/// Older workers could start a new traversal of the same job after a restart.
+async fn captured_prefix(state: &AppState, source: i64, job: i64) -> Result<VecDeque<i64>> {
+    let ids = sqlx::query_scalar("SELECT id FROM source_observations WHERE source_id=?1 AND job_id=?2
+        AND id >= (SELECT MAX(id) FROM source_observations WHERE source_id=?1 AND job_id=?2 AND page=0)
+        ORDER BY id")
+        .bind(source).bind(job).fetch_all(&state.db).await?;
+    Ok(ids.into())
+}
+
+async fn captured_page(
+    state: &AppState,
+    source: i64,
+    job: i64,
+    id: i64,
+) -> Result<(Observation, Option<String>, Page)> {
+    let row = sqlx::query(
+        "SELECT o.digest,o.request_url,o.url,o.next_link,o.etag,o.last_modified,d.body
+        FROM source_observations o JOIN raw_documents d USING(digest)
+        WHERE o.id=? AND o.job_id=? AND o.source_id=?",
+    )
+    .bind(id)
+    .bind(job)
+    .bind(source)
+    .fetch_one(&state.db)
+    .await?;
+    let bytes: Vec<u8> = row.get("body");
+    let digest: String = row.get("digest");
+    verify_body(&bytes, &digest)?;
+    let page = Page {
+        bytes,
+        url: row
+            .get::<Option<&str>, _>("url")
+            .map(Url::parse)
+            .transpose()?,
+        etag: row.get("etag"),
+        modified: row.get("last_modified"),
+        link: row.get("next_link"),
+    };
+    Ok((
+        Observation { id, source, digest },
+        row.get("request_url"),
+        page,
+    ))
 }
 
 async fn save(
@@ -609,6 +672,19 @@ pub(crate) async fn inspect_page(
 #[path = "nested_io.rs"]
 mod nested_io;
 
+pub(super) async fn preview_nested(
+    state: &AppState,
+    source: &Source,
+    rule: &super::nested::Nested,
+) -> Result<(Catalog, super::nested::SelectionCounts)> {
+    ensure!(
+        source.url.is_some() != source.upload.is_some(),
+        "expected one manifest URL or upload"
+    );
+    source.mapping.validate()?;
+    nested_io::preview(state, source, rule).await
+}
+
 pub(super) async fn discover(
     state: &AppState,
     url: Option<&str>,
@@ -652,37 +728,38 @@ pub(crate) async fn collect(
         0
     };
     if let Some(rule) = &source.mapping.nested {
-        let (local, observations) =
-            nested_io::collect(state, source, rule, job, conditional, retries, limits).await?;
+        let (local, observations) = if let Some(job) = job {
+            nested_io::collect(state, source, rule, job, conditional, retries, limits).await?
+        } else {
+            (preview_nested(state, source, rule).await?.0, Vec::new())
+        };
         adapter::merge(catalog, local)?;
         return Ok(observations);
     }
     let mut walk = Walk::new(source.url.clone(), job.is_none());
     let mut observations = Vec::new();
+    let mut pending = if let Some(job) = job {
+        captured_prefix(state, source.id, job).await?
+    } else {
+        VecDeque::new()
+    };
     while let Some(target) = walk.take()? {
-        let page = read(
-            state,
-            source,
-            target.url.as_ref(),
-            conditional,
-            retries,
-            limits,
-        )
-        .await?;
-        let observation = if let Some(job) = job {
-            Some(
-                save(
-                    state,
-                    source.id,
-                    job,
-                    walk.pages - 1,
-                    target.url.as_ref(),
-                    &page,
-                )
-                .await?,
-            )
+        let url = target.url.as_ref();
+        let (page, observation) = if let (Some(job), Some(id)) = (job, pending.pop_front()) {
+            let (observation, request, page) = captured_page(state, source.id, job, id).await?;
+            ensure!(
+                request.as_deref() == url.map(Url::as_str),
+                "snapshot does not match selected page"
+            );
+            (page, Some(observation))
         } else {
-            None
+            let page = read(state, source, url, conditional, retries, limits).await?;
+            let observation = if let Some(job) = job {
+                Some(save(state, source.id, job, walk.pages - 1, url, &page).await?)
+            } else {
+                None
+            };
+            (page, observation)
         };
         let local = walk.accept(target, &page, &source.mapping, None, None)?;
         if let Some(observation) = observation {
@@ -691,6 +768,7 @@ pub(crate) async fn collect(
         }
         adapter::merge(catalog, local)?;
     }
+    ensure!(pending.is_empty(), "excess snapshot pages");
     Ok(observations)
 }
 
@@ -771,12 +849,15 @@ pub(crate) async fn restore(
                 target.url.as_ref().map(Url::as_str) == row.get::<Option<&str>, _>("request_url"),
                 "snapshot does not match selected page"
             );
+            let bytes: Vec<u8> = row.get("body");
+            let digest: String = row.get("digest");
+            verify_body(&bytes, &digest)?;
             let page = Page {
                 url: row
                     .get::<Option<&str>, _>("url")
                     .map(Url::parse)
                     .transpose()?,
-                bytes: row.get("body"),
+                bytes,
                 link: row.get("next_link"),
                 etag: None,
                 modified: None,
@@ -786,7 +867,7 @@ pub(crate) async fn restore(
             observations.push(Observation {
                 id: row.get("id"),
                 source: source.id,
-                digest: row.get("digest"),
+                digest,
             });
         }
         ensure!(walk.pending.is_empty(), "accepted input set is incomplete");

@@ -17,7 +17,7 @@ import { Keys } from "./Keys";
 import { RuntimeView } from "./Runtime";
 import { api, cache } from "./api";
 import type { ReactNode } from "react";
-import type { Project } from "./model";
+import type { Project, SourcePreview } from "./model";
 
 beforeAll(() => {
   Object.defineProperty(HTMLDialogElement.prototype, "showModal", {
@@ -418,7 +418,12 @@ const hashBranch = {
   sample_pointer: "/objects/logo/hash",
 };
 const urlTemplate = "https://files.example.org/{prefix}/{digest}";
-function nestedApi() {
+function nestedApi(
+  preview: SourcePreview = {
+    ...reviewed,
+    selection: { matched: 2, previewed: 2 },
+  },
+) {
   const calls: { path: string; method: string; body: any }[] = [];
   vi.stubGlobal(
     "fetch",
@@ -435,7 +440,7 @@ function nestedApi() {
           return ok({ ...base, sample, branches: [templatesRoot] });
         return ok({ ...base, collections: [nestedRoot] });
       }
-      if (path.endsWith("/preview")) return ok(reviewed);
+      if (path.endsWith("/preview")) return ok(preview);
       return ok({ id: 20 });
     }),
   );
@@ -449,9 +454,9 @@ it("follows a filtered release sample, selects file and optional library branche
   });
   fireEvent.click(screen.getByRole("button", { name: "Inspect manifest" }));
   const limit = (await screen.findByLabelText(
-    "Release limit",
+    "Sync release limit",
   )) as HTMLInputElement;
-  expect(limit.value).toBe("5");
+  expect(limit.value).toBe("");
   fireEvent.change(limit, { target: { value: "2" } });
   fireEvent.change(screen.getByLabelText("Add release filter"), {
     target: { value: "/type" },
@@ -607,7 +612,16 @@ it("reopens saved nested selections and preserves their rules while changing the
   expect((screen.getByLabelText("stable") as HTMLInputElement).checked).toBe(
     true,
   );
-  fireEvent.change(screen.getByLabelText("Release limit"), {
+  const limit = screen.getByLabelText("Sync release limit") as HTMLInputElement;
+  expect(limit.value).toBe("5");
+  fireEvent.click(
+    screen.getByRole("button", { name: "Preview selected files" }),
+  );
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Change selection" }),
+  );
+  expect(calls.at(-1)?.body).toEqual({ url, mapping: { nested } });
+  fireEvent.change(limit, {
     target: { value: "8" },
   });
   fireEvent.click(
@@ -616,9 +630,7 @@ it("reopens saved nested selections and preserves their rules while changing the
   fireEvent.click(
     await screen.findByRole("button", { name: "Change selection" }),
   );
-  expect(
-    (screen.getByLabelText("Release limit") as HTMLInputElement).value,
-  ).toBe("8");
+  expect(limit.value).toBe("8");
   fireEvent.click(
     screen.getByRole("button", { name: "Preview selected files" }),
   );
@@ -628,6 +640,73 @@ it("reopens saved nested selections and preserves their rules while changing the
       path: "/api/admin/sources/20",
       method: "PATCH",
       body: { url, mapping: { nested: { ...nested, limit: 8 } } },
+    }),
+  );
+});
+
+it("saves all matching releases with sample counts and version-specific warnings in review", async () => {
+  const calls = nestedApi({
+    releases: [{ ...reviewed.releases[0], artifacts: [] }, reviewed.releases[1]],
+    selection: { matched: 713, previewed: 5 },
+    warnings: [
+      { version: "0.3", error: "No files matched the selection" },
+      { version: "0.2", error: "Linked document returned HTTP 404" },
+      { version: "0.1", error: "Linked document returned HTTP 404" },
+    ],
+  });
+  mount(<ImportSource id={9} onClose={() => {}} />);
+  fireEvent.change(screen.getByLabelText("Manifest URL"), {
+    target: { value: url },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Inspect manifest" }));
+  await screen.findByText("The preview checks up to 5 releases.");
+  const limit = screen.getByLabelText("Sync release limit") as HTMLInputElement;
+  expect(limit.value).toBe("");
+  fireEvent.change(screen.getByLabelText("Add release filter"), {
+    target: { value: "/type" },
+  });
+  fireEvent.click(screen.getByLabelText("stable"));
+  fireEvent.click(
+    screen.getByRole("button", { name: "Inspect sample release" }),
+  );
+  fireEvent.click(await screen.findByRole("button", { name: "Use as file" }));
+  fireEvent.click(screen.getByLabelText("Require this branch in every match"));
+  fireEvent.click(
+    screen.getByRole("button", { name: "Preview selected files" }),
+  );
+  const warning = await screen.findByText(
+    "3 sampled releases had preview issues",
+  );
+  expect(warning.parentElement?.textContent).toContain(
+    "0.3 · No files matched the selection",
+  );
+  expect(warning.parentElement?.textContent).toContain(
+    "0.2 · Linked document returned HTTP 404",
+  );
+  expect(screen.getByText(/releases selected for sync/).textContent).toBe(
+    "713 releases selected for sync. Preview checked 5 releases.",
+  );
+  expect(
+    screen.getByText(/2 releases previewed successfully · 1 file/),
+  ).toBeTruthy();
+  const input = {
+    url,
+    mapping: {
+      nested: {
+        path: "/versions",
+        version_path: "/id",
+        filters: [{ path: "/type", values: ["stable"] }],
+        rules: [{ kind: "file", path: "", url_path: "/url", required: false }],
+      },
+    },
+  };
+  expect(calls.at(-1)?.body).toEqual(input);
+  fireEvent.click(screen.getByRole("button", { name: "Import source" }));
+  await waitFor(() =>
+    expect(calls.at(-1)).toEqual({
+      path: "/api/admin/runtimes/9/sources",
+      method: "POST",
+      body: input,
     }),
   );
 });

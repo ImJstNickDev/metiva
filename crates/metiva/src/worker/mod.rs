@@ -39,6 +39,18 @@ pub async fn preview(state: &AppState, input: &SourceInput) -> Result<Value> {
         upload: input.upload.as_ref().map(|v| v.as_bytes().to_vec()),
         mapping: mapping(input.mapping.clone())?,
     };
+    if let Some(rule) = &source.mapping.nested {
+        let (sample, count) = feed::preview_nested(state, &source, rule).await?;
+        let warnings: Vec<_> = sample
+            .release_errors
+            .iter()
+            .map(|(version, error)| json!({"version":version, "error":error}))
+            .collect();
+        return Ok(
+            json!({"releases": adapter::releases(&sample), "warnings": warnings,
+            "selection": {"matched": count.selected, "previewed": count.previewed}}),
+        );
+    }
     let mut catalog = Catalog::new();
     feed::collect(state, &source, None, false, &mut catalog, None).await?;
     if let Some((version, error)) = catalog.release_errors.first_key_value() {

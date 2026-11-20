@@ -3,6 +3,7 @@
 import fcntl
 import hashlib
 import json
+import re
 import socket
 import struct
 import threading
@@ -29,6 +30,7 @@ class Origin(BaseHTTPRequestHandler):
     def do_GET(self):
         root = Path("/fixture")
         filename = {
+            "/history.json": "history.json",
             "/source.json": "source.json",
             "/first.json": "first.json",
             "/second.json": "second.json",
@@ -44,6 +46,13 @@ class Origin(BaseHTTPRequestHandler):
             "/beta.bin": "beta.bin",
             "/gamma.bin": "gamma.bin",
         }.get(self.path)
+        if history := re.fullmatch(r"/history/(\d{4})\.(json|bin)", self.path):
+            filename = "history-" + history[1] + "." + history[2]
+            if history[2] == "json":
+                with config_lock, (root / "history-reads").open("a") as reads:
+                    reads.write(history[1] + "\n")
+                if int(history[1]) >= 340 and (root / "history-delay").exists():
+                    time.sleep(0.12)
         if self.path.startswith("/pool/") and (root / "payload.json").exists():
             digest = hashlib.sha1((root / "payload.json").read_bytes()).hexdigest()
             if self.path == f"/pool/{digest[:2]}/{digest}":

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.3
+
+- Mirror every matching release in a nested catalogue. New selections include the whole history by default. Existing saved release limits keep their values.
+- Preview up to five matching records and see the full selection count before saving. A missing file or unavailable child appears beside the affected sample.
+- Resume interrupted nested discovery from the source documents already captured for the job. Sync history shows how many documents the worker has read before downloads begin.
+
 ## v0.1.2
 
 - Follow linked JSON documents within a release. Inspect a sample at each level, select which references to open and which files to mirror, and filter the releases before fetching child documents.

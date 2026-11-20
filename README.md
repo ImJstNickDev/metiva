@@ -17,7 +17,7 @@ Download the production Compose file into a new directory on a Linux amd64 host.
 ```sh
 mkdir metiva && cd metiva
 curl --fail --location --output compose-prod.yaml \
-  https://github.com/ImJstNickDev/metiva/releases/download/v0.1.2/compose-prod.yaml
+  https://github.com/ImJstNickDev/metiva/releases/download/v0.1.3/compose-prod.yaml
 install -d -m 700 data
 install -d -m 755 data/artifacts
 printf 'METIVA_UID=%s\nMETIVA_GID=%s\n' "$(id -u)" "$(id -g)" > .env
@@ -33,7 +33,7 @@ For source builds and deployments on an existing external proxy network, use the
 ## Publish a runtime
 
 1. In **Projects**, create a project and a runtime. Choose visibility explicitly when you want anonymous downloads.
-2. Import a manifest URL or upload JSON. Select a release list, filter records and inspect a sample. Follow linked documents to the files you want, or use the linked-index picker for channel and platform maps. Preview the files and known download size before saving.
+2. Import a manifest URL or upload JSON. Select a release list, filter records and inspect a sample. Follow linked documents to the files you want, or use the linked-index picker for channel and platform maps. For a nested source, review a sample of up to five releases and its known file sizes. Leave the sync limit blank to mirror the full matching history.
 3. Add the source and start synchronization. **Transfers** shows observed bytes, verification and retries.
 4. Copy the published endpoint from the runtime. Consumers can fetch the manifest at `/p/{project}/r/{runtime}/manifest.json`. A compatible single feed can also provide `upstream.json`.
 5. Select a filename in **Publication** for its revision timeline. A verified correction takes over its existing URL. An administrator can download earlier bytes from the timeline.

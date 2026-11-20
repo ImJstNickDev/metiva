@@ -231,9 +231,7 @@ function CollectionEditor({
   inspect: Inspect;
 }) {
   const inspecting = useIsMutating({ mutationKey: ["sample-document"] }) > 0;
-  const [limit, setLimit] = useState(
-    initial ? String(initial.limit ?? "") : "5",
-  );
+  const [limit, setLimit] = useState(String(initial?.limit ?? ""));
   const [filters, setFilters] = useState<ReleaseFilter[]>(
     initial?.filters?.map((f) => ({ ...f, values: f.values.map(String) })) ??
       [],
@@ -272,7 +270,7 @@ function CollectionEditor({
       <fieldset disabled={busy || inspecting}>
         <div className="scope-settings">
           <Field
-            label="Release limit"
+            label="Sync release limit"
             hint="Applies after filtering, in collection order. Leave blank for all matching releases."
           >
             <input
@@ -300,18 +298,12 @@ function CollectionEditor({
           rules={rules}
           onChange={setRules}
         />
+        <small className="hint">The preview checks up to 5 releases.</small>
         {incomplete && (
           <small role="status" className="hint">
             {incomplete}
           </small>
         )}
-        {error instanceof Error &&
-          /limit|exceeds|too many/i.test(error.message) && (
-            <small className="hint">
-              Reduce the release limit or select fewer file groups to fit the
-              preview.
-            </small>
-          )}
       </fieldset>
     </Form>
   );
