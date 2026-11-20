@@ -1,3 +1,4 @@
+use super::adapter::ManifestAdapter;
 use super::{
     adapter::{self, Catalog, Mapping},
     http,
@@ -56,7 +57,13 @@ fn next_link(value: &str) -> Option<String> {
     })
 }
 
-async fn remote(state: &AppState, source: i64, url: &Url, conditional: bool) -> Result<Page> {
+async fn remote(
+    state: &AppState,
+    source: i64,
+    url: &Url,
+    conditional: bool,
+    max_retries: u32,
+) -> Result<Page> {
     let cached = if conditional {
         sqlx::query("SELECT o.url,o.etag,o.last_modified,o.next_link,o.digest FROM source_observations o WHERE source_id=? AND request_url=? ORDER BY id DESC LIMIT 1").bind(source).bind(url.as_str()).fetch_optional(&state.db).await?
     } else {
@@ -76,8 +83,33 @@ async fn remote(state: &AppState, source: i64, url: &Url, conditional: bool) -> 
             }
         }
     }
-    let response = http::get(url.clone(), headers, false).await?;
+    let validators = headers.contains_key(IF_NONE_MATCH) || headers.contains_key(IF_MODIFIED_SINCE);
+    let mut retries = 0;
+    let response = loop {
+        let fetched = http::limited_get(&state.db, url.clone(), headers.clone(), false, None).await;
+        if retries == max_retries
+            || fetched
+                .as_ref()
+                .is_ok_and(|r| !matches!(r.status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504))
+        {
+            break fetched?;
+        }
+        let backoff = 2_i64.pow(retries.min(8) + 1) + i64::from(rand::random::<u8>() % 3);
+        let delay = http::cooldown(&state.db, url.host_str().context("missing host")?)
+            .await?
+            .map(|d| d - chrono::Utc::now().timestamp())
+            .unwrap_or(0)
+            .max(backoff);
+        ensure!(
+            delay <= 120,
+            "source is temporarily rate limited; the worker will check again on its next scheduled sync"
+        );
+        drop(fetched);
+        tokio::time::sleep(std::time::Duration::from_secs(delay as u64)).await;
+        retries += 1;
+    };
     if response.status == StatusCode::NOT_MODIFIED {
+        ensure!(validators, "unsolicited 304 without a conditional request");
         let row = cached.context("unexpected 304 without a previous observation")?;
         ensure!(
             row.get::<Option<String>, _>("url").as_deref() == Some(response.url.as_str()),
@@ -155,12 +187,17 @@ pub(crate) async fn collect(
     let mut next = source.url.clone();
     let mut seen = HashSet::new();
     let mut total = 0;
+    let max_retries = if job.is_some() {
+        super::settings(state).await?.retries
+    } else {
+        0
+    };
     let mut observations = Vec::new();
     for index in 0..MAX_PAGES {
         let request = next.take();
         let page = if let Some(url) = &request {
             ensure!(seen.insert(url.clone()), "pagination cycle");
-            remote(state, source.id, url, conditional).await?
+            remote(state, source.id, url, conditional, max_retries).await?
         } else {
             let bytes = source.upload.as_ref().context("missing source data")?;
             ensure!(
@@ -181,7 +218,12 @@ pub(crate) async fn collect(
             observations.push(save(state, source.id, job, index, request.as_ref(), &page).await?);
         }
         let mut local = Catalog::new();
-        next = adapter::parse(&page.bytes, &source.mapping, page.url.as_ref(), &mut local)?;
+        next = adapter::GenericJson.parse_page(
+            &page.bytes,
+            &source.mapping,
+            page.url.as_ref(),
+            &mut local,
+        )?;
         if job.is_some() {
             let observation = observations.last().context("missing snapshot identity")?;
             let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;

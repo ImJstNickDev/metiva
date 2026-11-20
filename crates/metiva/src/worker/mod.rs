@@ -5,7 +5,7 @@ mod http;
 mod integrity;
 
 use crate::{AppState, SourceInput};
-use adapter::{Artifact, Catalog, Mapping};
+use adapter::{Artifact, Catalog, ManifestAdapter, Mapping};
 use anyhow::{Context, Result, ensure};
 use download::Transfer;
 use feed::{Observation, Source};
@@ -264,13 +264,14 @@ async fn sync(state: &AppState, runtime: i64, job: i64, limits: Arc<http::Limits
             .as_deref()
             .map(Url::parse)
             .transpose()?;
-        adapter::rewrite(
-            &row.get::<Vec<u8>, _>("body"),
-            &inputs[0].mapping,
-            base.as_ref(),
-            &mirror,
-        )
-        .map(|v| v.to_string())
+        adapter::GenericJson
+            .compatible_manifest(
+                &row.get::<Vec<u8>, _>("body"),
+                &inputs[0].mapping,
+                base.as_ref(),
+                &mirror,
+            )
+            .map(|v| v.to_string())
     } else {
         None
     };
@@ -333,5 +334,132 @@ pub async fn run(state: AppState) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    async fn job(state: &AppState) -> i64 {
+        sqlx::query("INSERT INTO jobs(runtime_id,state) VALUES(1,'running')")
+            .execute(&state.db)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+    }
+    async fn active(state: &AppState) -> i64 {
+        sqlx::query_scalar("SELECT active_publication FROM runtimes WHERE id=1")
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn failed_source_and_publication_transaction_preserve_available_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = crate::open(dir.path(), "https://mirror.example")
+            .await
+            .unwrap();
+        for query in [
+            "INSERT INTO projects(name,slug) VALUES('Project','p')",
+            "INSERT INTO runtimes(project_id,name,slug) VALUES(1,'Runtime','r')",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(query))
+                .execute(&s.db)
+                .await
+                .unwrap();
+        }
+        let digest = hex::encode(Sha256::digest(b"archive"));
+        let path = s.data.join("artifacts").join(&digest);
+        tokio::fs::write(&path, b"archive").await.unwrap();
+        let source=json!({"releases":[{"version":"a","assets":[{"filename":"package.bin","url":"https://example.com/download","size":7,"sha256":digest}]}],"unknown":"keep"}).to_string();
+        sqlx::query("INSERT INTO sources(runtime_id,kind,upload) VALUES(1,'upload',?)")
+            .bind(source.as_bytes())
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let limits = Arc::new(http::Limits::new(1, 1));
+        process(s.clone(), 1, job(&s).await, limits.clone())
+            .await
+            .unwrap();
+        let published = active(&s).await;
+        let upstream: String = sqlx::query_scalar("SELECT upstream FROM publications WHERE id=?")
+            .bind(published)
+            .fetch_one(&s.db)
+            .await
+            .unwrap();
+        assert!(
+            upstream.contains("https://mirror.example/p/p/r/r/files/a/package.bin")
+                && upstream.contains("keep")
+        );
+        sqlx::query("UPDATE sources SET upload=X'7b' WHERE id=1")
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let failed = job(&s).await;
+        process(s.clone(), 1, failed, limits.clone()).await.unwrap();
+        assert_eq!(active(&s).await, published);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM jobs WHERE id=?")
+                .bind(failed)
+                .fetch_one(&s.db)
+                .await
+                .unwrap(),
+            "failed"
+        );
+        let empty = b"{\"releases\":[]}";
+        sqlx::query("UPDATE sources SET upload=? WHERE id=1")
+            .bind(empty.as_slice())
+            .execute(&s.db)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER inject_failure BEFORE UPDATE OF active_publication ON runtimes BEGIN SELECT RAISE(ABORT,'simulated publication failure'); END").execute(&s.db).await.unwrap();
+        process(s.clone(), 1, job(&s).await, limits.clone())
+            .await
+            .unwrap();
+        assert_eq!(active(&s).await, published);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM publications")
+                .fetch_one(&s.db)
+                .await
+                .unwrap(),
+            1
+        );
+        sqlx::query("DROP TRIGGER inject_failure")
+            .execute(&s.db)
+            .await
+            .unwrap();
+        let recovered = job(&s).await;
+        // With a job persisted as running, restart the actual scheduler and await publication.
+        let worker = tokio::spawn(run(s.clone()));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if active(&s).await != published {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM source_observations WHERE job_id=?")
+                .bind(recovered)
+                .fetch_one(&s.db)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"archive");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM files WHERE publication_id=?")
+                .bind(published)
+                .fetch_one(&s.db)
+                .await
+                .unwrap(),
+            1
+        );
     }
 }

@@ -135,6 +135,7 @@ async fn resolve(url: &Url) -> Result<(String, Vec<SocketAddr>)> {
 pub(crate) struct Limits {
     global: Arc<Semaphore>,
     hosts: Mutex<HashMap<String, Weak<Semaphore>>>,
+    objects: Mutex<HashMap<String, Weak<Semaphore>>>,
     per_host: usize,
 }
 impl Limits {
@@ -142,22 +143,33 @@ impl Limits {
         Self {
             global: Arc::new(Semaphore::new(global)),
             hosts: Mutex::new(HashMap::new()),
+            objects: Mutex::default(),
             per_host,
         }
     }
+    fn keyed(
+        map: &Mutex<HashMap<String, Weak<Semaphore>>>,
+        key: String,
+        count: usize,
+    ) -> Arc<Semaphore> {
+        let mut owners = map.lock().unwrap();
+        owners.retain(|_, weak| weak.strong_count() > 0);
+        let slot = owners.entry(key).or_default();
+        slot.upgrade().unwrap_or_else(|| {
+            let sem = Arc::new(Semaphore::new(count));
+            *slot = Arc::downgrade(&sem);
+            sem
+        })
+    }
+    pub async fn object(&self, key: String) -> Result<OwnedSemaphorePermit> {
+        Ok(Self::keyed(&self.objects, key, 1).acquire_owned().await?)
+    }
     async fn acquire(&self, host: &str) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
-        let host_limit = {
-            let mut hosts = self.hosts.lock().unwrap();
-            hosts.retain(|_, weak| weak.strong_count() > 0);
-            let slot = hosts
-                .entry(host.trim_end_matches('.').to_lowercase())
-                .or_default();
-            slot.upgrade().unwrap_or_else(|| {
-                let sem = Arc::new(Semaphore::new(self.per_host));
-                *slot = Arc::downgrade(&sem);
-                sem
-            })
-        };
+        let host_limit = Self::keyed(
+            &self.hosts,
+            host.trim_end_matches('.').to_lowercase(),
+            self.per_host,
+        );
         let host = host_limit.acquire_owned().await?;
         Ok((host, self.global.clone().acquire_owned().await?))
     }
@@ -317,16 +329,40 @@ async fn curl_response(
     })
 }
 
-pub(crate) async fn get(url: Url, headers: HeaderMap, curl: bool) -> Result<Response> {
-    limited_get(url, headers, curl, None).await
+pub(crate) fn retry_after(value: &str, clock: std::time::SystemTime) -> Option<i64> {
+    let delay = value.parse::<u64>().ok().or_else(|| {
+        Some(
+            httpdate::parse_http_date(value)
+                .ok()?
+                .duration_since(clock)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+    })?;
+    Some(delay.min(24 * 3600) as i64)
+}
+
+async fn set_cooldown(db: &sqlx::SqlitePool, host: &str, until: i64) -> Result<()> {
+    sqlx::query("INSERT INTO origin_cooldowns(host,retry_after) VALUES(?,?) ON CONFLICT(host) DO UPDATE SET retry_after=MAX(retry_after,excluded.retry_after)").bind(host).bind(until).execute(db).await?;
+    Ok(())
+}
+pub(crate) async fn cooldown(db: &sqlx::SqlitePool, host: &str) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT retry_after FROM origin_cooldowns WHERE host=? AND retry_after>unixepoch()",
+    )
+    .bind(host)
+    .fetch_optional(db)
+    .await?)
 }
 pub(crate) async fn limited_get(
+    db: &sqlx::SqlitePool,
     mut url: Url,
     mut headers: HeaderMap,
     curl: bool,
     limits: Option<&Limits>,
 ) -> Result<Response> {
     let mut seen = HashSet::new();
+    let original = url.host_str().context("missing hostname")?.to_owned();
     for _ in 0..=REDIRECTS {
         url.set_fragment(None);
         ensure!(seen.insert(url.clone()), "redirect cycle");
@@ -335,6 +371,12 @@ pub(crate) async fn limited_get(
             Some(l) => Some(l.acquire(&host).await?),
             None => None,
         };
+        if let Some(until) = cooldown(db, &host).await? {
+            if original != host {
+                set_cooldown(db, &original, until).await?;
+            }
+            bail!("upstream Retry-After is active until {until}");
+        }
         let mut response = if curl {
             timeout(
                 idle_timeout(),
@@ -367,6 +409,19 @@ pub(crate) async fn limited_get(
             }
         };
         response._permits = permits;
+        if matches!(response.status.as_u16(), 429 | 503)
+            && let Some(delay) = response
+                .headers
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| retry_after(v, std::time::SystemTime::now()))
+        {
+            let until = chrono::Utc::now().timestamp() + delay;
+            set_cooldown(db, &host, until).await?;
+            if original != host {
+                set_cooldown(db, &original, until).await?;
+            }
+        }
         if !matches!(response.status.as_u16(), 301 | 302 | 303 | 307 | 308) {
             return Ok(response);
         }

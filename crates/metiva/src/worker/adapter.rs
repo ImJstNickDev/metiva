@@ -344,8 +344,15 @@ impl Scan<'_> {
         let mut meta = Map::new();
         if assets.is_some() {
             meta = release.as_object().cloned().unwrap_or_default();
-            for k in VERSION.iter().chain(ASSETS) {
-                meta.remove(*k);
+            if let Some((p, _)) = select(release, &m.version_path, VERSION)
+                && let Some(k) = p.split('/').nth(1)
+            {
+                meta.remove(&k.replace("~1", "/").replace("~0", "~"));
+            }
+            if let Some((p, _)) = &assets
+                && let Some(k) = p.split('/').nth(1)
+            {
+                meta.remove(&k.replace("~1", "/").replace("~0", "~"));
             }
             for p in [&m.version_path, &m.artifacts_path].into_iter().flatten() {
                 if let Some(first) = pointer(p).split('/').nth(1) {
@@ -413,6 +420,45 @@ fn scan(root: &Value, m: &Mapping, base: Option<&Url>) -> Result<Document> {
     }
     Ok(scan.doc)
 }
+/// Adapters normalize one document at a time. The worker owns transport, page limits,
+/// snapshot retention and publication, so an added format inherits those guarantees.
+pub(crate) trait ManifestAdapter {
+    fn parse_page(
+        &self,
+        bytes: &[u8],
+        mapping: &Mapping,
+        base: Option<&Url>,
+        out: &mut Catalog,
+    ) -> Result<Option<Url>>;
+    fn compatible_manifest(
+        &self,
+        bytes: &[u8],
+        mapping: &Mapping,
+        base: Option<&Url>,
+        mirrored: &Catalog,
+    ) -> Option<Value>;
+}
+pub(crate) struct GenericJson;
+impl ManifestAdapter for GenericJson {
+    fn parse_page(
+        &self,
+        bytes: &[u8],
+        m: &Mapping,
+        base: Option<&Url>,
+        out: &mut Catalog,
+    ) -> Result<Option<Url>> {
+        parse(bytes, m, base, out)
+    }
+    fn compatible_manifest(
+        &self,
+        bytes: &[u8],
+        m: &Mapping,
+        base: Option<&Url>,
+        mirrored: &Catalog,
+    ) -> Option<Value> {
+        rewrite(bytes, m, base, mirrored)
+    }
+}
 pub(crate) fn parse(
     bytes: &[u8],
     m: &Mapping,
@@ -443,7 +489,22 @@ pub(crate) fn releases(catalog: &Catalog) -> Value {
     json!(
         versions
             .into_iter()
-            .map(|(version, artifacts)| json!({"version":version,"artifacts":artifacts}))
+            .map(|(version, artifacts)| {
+                let mut release = json!({"version":version,"artifacts":artifacts});
+                for key in [
+                    "title",
+                    "name",
+                    "channel",
+                    "published_at",
+                    "date",
+                    "prerelease",
+                ] {
+                    if let Some(v) = catalog.versions.get(version).and_then(|m| m.get(key)) {
+                        release[key] = v.clone();
+                    }
+                }
+                release
+            })
             .collect::<Vec<_>>()
     )
 }
@@ -474,4 +535,91 @@ pub(crate) fn rewrite(
         *root.pointer_mut(&pointer)? = Value::String(mirrored.assets.get(&id)?.url.to_string());
     }
     Some(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn mapping_relative_urls_and_repeated_positions() {
+        let m:Mapping=serde_json::from_value(json!({"releases_path":"/envelope/items","version_path":"meta.tag","artifacts_path":"variants","url_path":"file.url"})).unwrap();
+        let input=br#"{"envelope":{"items":[{"meta":{"tag":"v1"},"variants":[{"file":{"url":"downloads/a%20b.bin"}},{"file":{"url":"downloads/a%20b.bin"}}]}]},"next":"?page=2","custom":42}"#;
+        let base = Url::parse("https://example.com/list").unwrap();
+        let mut catalog = Catalog::new();
+        assert_eq!(
+            parse(input, &m, Some(&base), &mut catalog)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "https://example.com/list?page=2"
+        );
+        assert_eq!(catalog.assets.len(), 1);
+        let id = ("v1".into(), "a b.bin".into());
+        catalog.assets.get_mut(&id).unwrap().url = Url::parse("https://mirror.example/a").unwrap();
+        let result = rewrite(input, &m, Some(&base), &catalog).unwrap();
+        assert_eq!(result["custom"], 42);
+        for a in result
+            .pointer("/envelope/items/0/variants")
+            .unwrap()
+            .as_array()
+            .unwrap()
+        {
+            assert_eq!(a["file"]["url"], "https://mirror.example/a");
+        }
+    }
+    #[test]
+    fn platform_maps_release_metadata_and_conflicts() {
+        let feed = json!({"versions":{"rolling":{"channel":"stable","platforms":{"linux-x64":{"url":"https://example.com/pkg.bin", "arch":"x64"}}},"pending":{"files":[]}}});
+        let mut found = Catalog::new();
+        parse(
+            feed.to_string().as_bytes(),
+            &Mapping::default(),
+            None,
+            &mut found,
+        )
+        .unwrap();
+        assert_eq!(
+            found.assets[&("rolling".into(), "pkg.bin".into())].metadata["platform"],
+            "linux-x64"
+        );
+        assert!(found.versions.contains_key("pending"));
+        let before = found.clone();
+        let mut conflicting = feed.clone();
+        conflicting["versions"]["rolling"]["channel"] = json!("beta");
+        assert!(
+            parse(
+                conflicting.to_string().as_bytes(),
+                &Mapping::default(),
+                None,
+                &mut found
+            )
+            .is_err()
+        );
+        let mut missing = before.clone();
+        let conflict =
+            br#"[{"version":"rolling","assets":[{"url":"https://elsewhere.example/pkg.bin"}]}]"#;
+        assert!(parse(conflict, &Mapping::default(), None, &mut missing).is_err());
+    }
+    #[test]
+    fn signed_and_invalid_inputs() {
+        let signed = br#"{"signature":"original-only","releases":[]}"#;
+        assert!(rewrite(signed, &Mapping::default(), None, &Catalog::new()).is_none());
+        for input in [
+            r#"{"releases":[{"version":".","artifacts":[]}]}"#,
+            r#"[{"version":"x","files":["https://example.com/a%2Fb"]}]"#,
+            r#"[{"version":"x","files":[{"url":"https://example.com/file","digest":"blake3:1234"}]}]"#,
+            r#"{"message":"error"}"#,
+        ] {
+            assert!(
+                parse(
+                    input.as_bytes(),
+                    &Mapping::default(),
+                    None,
+                    &mut Catalog::new()
+                )
+                .is_err(),
+                "{input}"
+            );
+        }
+    }
 }

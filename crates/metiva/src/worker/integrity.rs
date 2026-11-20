@@ -117,3 +117,34 @@ pub(crate) fn verify(
     }
     Ok((digest, size))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::BTreeMap, io::Write};
+    #[test]
+    fn checksum_and_archive_corruption() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"abc").unwrap();
+        let mut hashes = BTreeMap::from([
+            (
+                "md5".to_owned(),
+                "900150983cd24fb0d6963f7d28e17f72".to_owned(),
+            ),
+            (
+                "sha512".to_owned(),
+                hex::encode(sha2::Sha512::digest(b"abc")),
+            ),
+        ]);
+        assert!(verify(file.path(), "abc.bin", Some(3), None, &hashes).is_ok());
+        hashes.insert("md5".into(), "00000000000000000000000000000000".into());
+        assert!(verify(file.path(), "abc.bin", None, None, &hashes).is_err());
+        assert!(verify(file.path(), "broken.zip", None, None, &BTreeMap::new()).is_err());
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(b"compressed").unwrap();
+        let mut data = gz.finish().unwrap();
+        data.pop();
+        std::fs::write(file.path(), data).unwrap();
+        assert!(verify(file.path(), "truncated.gz", None, None, &BTreeMap::new()).is_err());
+    }
+}

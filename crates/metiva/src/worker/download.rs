@@ -26,19 +26,6 @@ fn limit() -> u64 {
         .min(i64::MAX as u64)
 }
 
-fn retry_after(value: &str, clock: std::time::SystemTime) -> Option<i64> {
-    let delay = value.parse::<u64>().ok().or_else(|| {
-        Some(
-            httpdate::parse_http_date(value)
-                .ok()?
-                .duration_since(clock)
-                .unwrap_or_default()
-                .as_secs(),
-        )
-    })?;
-    Some(delay.min(24 * 3600) as i64)
-}
-
 fn resume_total(value: &str, offset: u64) -> Option<u64> {
     let (interval, total) = value.strip_prefix("bytes ")?.split_once('/')?;
     let (start, end) = interval.split_once('-')?;
@@ -127,6 +114,13 @@ impl Transfer {
             self.item.size.unwrap_or(0) <= limit(),
             "artifact exceeds configured limit"
         );
+        let identity = self
+            .item
+            .sha256
+            .as_ref()
+            .map(|d| format!("sha256:{d}"))
+            .unwrap_or_else(|| self.item.url.to_string());
+        let _object = self.limits.object(identity).await?;
         let row = sqlx::query("SELECT validator,effective_url,digest FROM transfers WHERE id=?")
             .bind(self.id)
             .fetch_one(&state.db)
@@ -138,6 +132,15 @@ impl Transfer {
             {
                 return Ok(verified);
             }
+        }
+        let same_job:Option<String>=sqlx::query_scalar("SELECT digest FROM transfers WHERE source_url=? AND job_id=(SELECT job_id FROM transfers WHERE id=?) AND digest IS NOT NULL ORDER BY id LIMIT 1").bind(self.item.url.as_str()).bind(self.id).fetch_optional(&state.db).await?;
+        if let Some(digest) = same_job
+            && self.item.sha256.as_ref().is_none_or(|d| d == &digest)
+            && let Ok(result) = self
+                .verify(state.data.join("artifacts").join(&digest), Some(digest))
+                .await
+        {
+            return Ok(result);
         }
         let previous=sqlx::query("SELECT digest,validator,effective_url FROM transfers WHERE id<>? AND state='completed' AND source_url=? AND validator IS NOT NULL AND digest IS NOT NULL ORDER BY id DESC LIMIT 1").bind(self.id).bind(self.item.url.as_str()).fetch_optional(&state.db).await?;
         let mut revalidate = previous.is_some() && self.item.sha256.is_none();
@@ -170,26 +173,13 @@ impl Transfer {
                 );
             }
             let response = http::limited_get(
+                &state.db,
                 self.item.url.clone(),
                 headers,
                 self.curl,
                 Some(&self.limits),
             )
             .await?;
-            if matches!(response.status.as_u16(), 429 | 503)
-                && let Some(delay) = response
-                    .headers
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| retry_after(v, std::time::SystemTime::now()))
-            {
-                let deadline = now() + delay;
-                sqlx::query("INSERT INTO origin_cooldowns(host,retry_after) VALUES(?,?) ON CONFLICT(host) DO UPDATE SET retry_after=MAX(retry_after,excluded.retry_after)").bind(self.item.url.host_str()).bind(deadline).execute(&state.db).await?;
-                anyhow::bail!(
-                    "HTTP {} requested Retry-After of {delay} seconds",
-                    response.status.as_u16()
-                );
-            }
             if !range && revalidate && response.status == StatusCode::NOT_MODIFIED {
                 let prev = previous.as_ref().context("unsolicited artifact 304")?;
                 let digest: String = prev.get("digest");
@@ -306,7 +296,14 @@ impl Transfer {
         file.flush().await?;
         file.sync_all().await?;
         drop(file);
-        self.store(state, &path).await
+        let stored = self.store(state, &path).await?;
+        // Persist before releasing the identity lock so another release can reuse the object.
+        sqlx::query("UPDATE transfers SET digest=? WHERE id=?")
+            .bind(&stored.0)
+            .bind(self.id)
+            .execute(&state.db)
+            .await?;
+        Ok(stored)
     }
 
     async fn stop_command(&self, state: &AppState) -> Result<String> {
@@ -400,6 +397,20 @@ impl Transfer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retry_after_dates_and_bounds() {
+        let clock = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        assert_eq!(http::retry_after("90", clock), Some(90));
+        assert_eq!(http::retry_after("999999999", clock), Some(86400));
+        assert_eq!(
+            retry_after(
+                &httpdate::fmt_http_date(clock + Duration::from_secs(11)),
+                clock
+            ),
+            Some(11)
+        );
+        assert_eq!(http::retry_after("invalid", clock), None);
+    }
     #[test]
     fn resume_requires_an_exact_tail() {
         assert_eq!(resume_total("bytes 42-99/100", 42), Some(100));
