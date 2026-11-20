@@ -12,7 +12,12 @@ import urllib.request
 
 
 def main():
-    source = Path(__file__).resolve().parents[2] / "compose-prod.yaml"
+    source = Path(
+        os.environ.get(
+            "METIVA_TEST_COMPOSE_FILE",
+            Path(__file__).resolve().parents[2] / "compose-prod.yaml",
+        )
+    )
     with tempfile.TemporaryDirectory(prefix="metiva-standalone-") as tmp:
         root = Path(tmp)
         file = root / source.name
@@ -75,6 +80,8 @@ def main():
             METIVA_PORT="0",
             METIVA_PUBLIC_URL="http://localhost:8088",
         )
+        if subnet := os.environ.get("METIVA_TEST_SUBNET"):
+            env["METIVA_SUBNET"] = subnet
         if "--pull" in sys.argv:
             compose("pull")
         else:

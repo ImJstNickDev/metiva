@@ -55,3 +55,9 @@ services:
       interval: 15s
       retries: 3
       timeout: 4s
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${METIVA_SUBNET:-}

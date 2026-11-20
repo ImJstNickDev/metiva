@@ -2,7 +2,7 @@
 
 ## Standalone production deployment
 
-Download `compose-prod.yaml` from the release assets and follow the [quick start](../README.md#run-a-mirror). Compose creates a project bridge. Only the ingress publishes a host port (`8088:80` by default). The API and worker share the bridge and can connect to upstream sources. Bind mounts are relative to the Compose file unless you set an absolute `METIVA_DATA_DIR`.
+Download `compose-prod.yaml` from the release assets and follow the [quick start](../README.md#run-a-mirror). Compose creates a project bridge. Only the ingress publishes a host port (`8088:80` by default). The API and worker share the bridge and can connect to upstream sources. Docker assigns its subnet. If the host has exhausted its default address pools, set `METIVA_SUBNET` to a free local CIDR before startup. Bind mounts are relative to the Compose file unless you set an absolute `METIVA_DATA_DIR`.
 
 Local administration at `http://localhost:8088` uses the browser's localhost exception for secure cookies. For remote administration use an HTTPS reverse proxy and set `METIVA_PUBLIC_URL` to the exact origin shown in the browser. A reverse proxy on the same host can connect to a loopback-only binding. A proxy on another host or bridge needs a reachable host address. Set `METIVA_PORT` and `METIVA_BIND_ADDRESS` in `.env` to match your routing.
 
@@ -16,9 +16,9 @@ For the source-build `compose.yaml`, the backend bridge defaults to `10.243.62.0
 
 ## Back up and restore
 
-Stop the three Metiva services and take a consistent backup of the entire data directory, preserving ownership and permissions. Include `.env` separately. Restart with `docker compose up -d` after the backup completes. Treat the backup as private. It includes administrator credential verifiers, sessions and preserved private content.
+Stop the three Metiva services and take a consistent backup of the entire data directory, preserving ownership and permissions. Include `.env` separately. After a standalone backup, restart with `docker compose -f compose-prod.yaml up -d --wait`. For a source deployment, use `docker compose up -d --wait`. Treat the backup as private. It includes administrator credential verifiers, sessions and preserved private content.
 
-Restore into an empty local data directory at the configured path with the same UID/GID. Start the matching tagged code first and check `docker compose ps`, the active publication and an authenticated download before upgrading.
+Restore into an empty local data directory at the configured path with the same UID/GID. Start the matching tagged code first and check service health with `docker compose -f compose-prod.yaml ps` (or `docker compose ps` for source deployments), the active publication and an authenticated download before upgrading.
 
 ## Upgrade
 
@@ -52,7 +52,7 @@ METIVA_IMAGE_TAG=v0.1.2
 
 To pull from Docker Hub, set `METIVA_INGRESS_IMAGE=docker.io/imjstnick/metiva` and `METIVA_SERVICE_IMAGE=docker.io/imjstnick/metiva-service` with the same tag.
 
-Run `docker compose pull` followed by `docker compose up -d --no-build`. The API and worker use different commands from the same service image. The release image workflow targets Linux amd64. Build from the tagged source on other architectures.
+Run `docker compose -f compose-prod.yaml pull` followed by `docker compose -f compose-prod.yaml up -d --wait`. The API and worker use different commands from the same service image. The release image workflow targets Linux amd64. Build from the tagged source on other architectures.
 
 The v0.1.1 migration starts each cumulative library with its active v0.1.0 publication. Earlier copies of a current file appear in its timeline. Open **Sync history → Publication history** for a previous manifest and its original source documents. Files that were already administrator-only remain accessible under **Publication → Past files**.
 
