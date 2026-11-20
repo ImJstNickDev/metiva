@@ -1,0 +1,634 @@
+use crate::{AppState, SourceInput, worker};
+use axum::{
+    Extension, Json, Router,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{get, patch, post},
+};
+use futures_util::stream;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sqlx::{Column, Row, TypeInfo, ValueRef, sqlite::SqliteRow};
+use std::{
+    convert::Infallible,
+    fs, io,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime},
+};
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/api/admin/projects", get(projects).post(create_project))
+        .route("/api/admin/projects/{id}", patch(update_project))
+        .route(
+            "/api/admin/projects/{id}/runtimes",
+            get(runtimes).post(create_runtime),
+        )
+        .route(
+            "/api/admin/runtimes/{id}",
+            get(runtime).patch(update_runtime),
+        )
+        .route("/api/admin/runtimes/{id}/preview", post(preview))
+        .route("/api/admin/runtimes/{id}/sources", post(add_source))
+        .route(
+            "/api/admin/sources/{id}",
+            patch(replace_source).delete(remove_source),
+        )
+        .route("/api/admin/runtimes/{id}/sync", post(sync))
+        .route("/api/admin/transfers", get(transfers))
+        .route("/api/admin/transfers/{id}/{action}", post(control))
+        .route("/api/admin/events", get(events))
+        .route("/api/admin/archive", get(archive))
+        .route("/api/admin/originals/{id}", get(original))
+        .route("/api/admin/overview", get(overview))
+        .route("/api/admin/settings", get(settings).patch(update_settings))
+        .layer(Extension(Storage::default()))
+}
+struct ApiError(StatusCode, String);
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.0, Json(json!({"error":self.1}))).into_response()
+    }
+}
+impl From<sqlx::Error> for ApiError {
+    fn from(e: sqlx::Error) -> Self {
+        match &e {
+            sqlx::Error::RowNotFound => Self(StatusCode::NOT_FOUND, "Resource not found".into()),
+            sqlx::Error::Database(db) if db.is_unique_violation() => Self(
+                StatusCode::CONFLICT,
+                "This identifier is already in use".into(),
+            ),
+            sqlx::Error::Database(db) if db.is_foreign_key_violation() => {
+                Self(StatusCode::NOT_FOUND, "Parent resource not found".into())
+            }
+            _ => {
+                eprintln!("Database operation failed: {e}");
+                Self(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Database operation failed".into(),
+                )
+            }
+        }
+    }
+}
+type ResultJson = Result<Json<Value>, ApiError>;
+fn bad(msg: &str) -> ApiError {
+    ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg.into())
+}
+
+// Reporting queries explicitly select fields suitable for the authenticated dashboard.
+fn record(row: SqliteRow) -> Value {
+    let mut obj = serde_json::Map::new();
+    for col in row.columns() {
+        let i = col.ordinal();
+        let raw = row.try_get_raw(i).expect("selected column");
+        let val = if raw.is_null() {
+            Value::Null
+        } else {
+            match raw.type_info().name() {
+                "INTEGER" => json!(row.get::<i64, _>(i)),
+                "REAL" => json!(row.get::<f64, _>(i)),
+                _ => json!(row.get::<String, _>(i)),
+            }
+        };
+        obj.insert(col.name().into(), val);
+    }
+    Value::Object(obj)
+}
+fn records(rows: Vec<SqliteRow>) -> Value {
+    Value::Array(rows.into_iter().map(record).collect())
+}
+
+async fn projects(State(s): State<AppState>) -> ResultJson {
+    Ok(Json(records(sqlx::query("SELECT p.*,COUNT(r.id) runtime_count,MAX(r.last_success) last_success,CASE WHEN EXISTS(SELECT 1 FROM jobs j JOIN runtimes rt ON rt.id=j.runtime_id WHERE rt.project_id=p.id AND j.state='failed' AND j.id=(SELECT MAX(j2.id) FROM jobs j2 WHERE j2.runtime_id=rt.id)) THEN 'attention' WHEN MAX(r.last_success) IS NOT NULL THEN 'ready' ELSE 'idle' END status FROM projects p LEFT JOIN runtimes r ON r.project_id=p.id GROUP BY p.id ORDER BY p.name,p.id").fetch_all(&s.db).await?)))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Create {
+    name: String,
+    slug: String,
+    description: Option<String>,
+    visibility: Option<String>,
+    sync_interval: Option<i64>,
+}
+fn identity(c: &Create) -> Result<(), ApiError> {
+    if c.name.trim().is_empty() || c.name.len() > 128 || c.name.chars().any(char::is_control) {
+        return Err(bad("Use a name between 1 and 128 bytes"));
+    }
+    if c.slug.is_empty()
+        || c.slug.len() > 80
+        || !c
+            .slug
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        || c.slug.starts_with('-')
+        || c.slug.ends_with('-')
+    {
+        return Err(bad(
+            "Use lowercase letters, numbers and interior hyphens for the slug",
+        ));
+    }
+    Ok(())
+}
+fn visibility(value: &str, runtime: bool) -> Result<(), ApiError> {
+    if matches!(value, "public" | "private") || runtime && value == "inherit" {
+        Ok(())
+    } else {
+        Err(bad("Invalid visibility"))
+    }
+}
+fn interval(i: i64) -> Result<(), ApiError> {
+    if (60..=31_536_000).contains(&i) {
+        Ok(())
+    } else {
+        Err(bad("Sync interval must be 60 to 31536000 seconds"))
+    }
+}
+async fn create_project(State(s): State<AppState>, Json(c): Json<Create>) -> ResultJson {
+    identity(&c)?;
+    if c.sync_interval.is_some() {
+        return Err(bad("Set the sync interval on a runtime"));
+    }
+    let vis = c.visibility.as_deref().unwrap_or("private");
+    visibility(vis, false)?;
+    if c.description.as_ref().is_some_and(|d| d.len() > 4096) {
+        return Err(bad("Description exceeds 4096 bytes"));
+    }
+    Ok(Json(record(
+        sqlx::query(
+            "INSERT INTO projects(name,slug,description,visibility) VALUES(?,?,?,?) RETURNING *",
+        )
+        .bind(c.name.trim())
+        .bind(c.slug)
+        .bind(c.description.unwrap_or_default())
+        .bind(vis)
+        .fetch_one(&s.db)
+        .await?,
+    )))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Edit {
+    visibility: Option<String>,
+    sync_interval: Option<i64>,
+}
+async fn update_project(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(c): Json<Edit>,
+) -> ResultJson {
+    if c.sync_interval.is_some() {
+        return Err(bad("Set the sync interval on a runtime"));
+    }
+    let vis = c
+        .visibility
+        .as_deref()
+        .ok_or_else(|| bad("Visibility required"))?;
+    visibility(vis, false)?;
+    Ok(Json(record(
+        sqlx::query("UPDATE projects SET visibility=? WHERE id=? RETURNING *")
+            .bind(vis)
+            .bind(id)
+            .fetch_one(&s.db)
+            .await?,
+    )))
+}
+async fn runtimes(State(s): State<AppState>, Path(id): Path<i64>) -> ResultJson {
+    sqlx::query("SELECT id FROM projects WHERE id=?")
+        .bind(id)
+        .fetch_one(&s.db)
+        .await?;
+    Ok(Json(records(sqlx::query("SELECT r.*, COALESCE((SELECT state FROM jobs WHERE runtime_id=r.id ORDER BY id DESC LIMIT 1),'idle') status FROM runtimes r WHERE project_id=? ORDER BY r.name,r.id").bind(id).fetch_all(&s.db).await?)))
+}
+async fn create_runtime(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(c): Json<Create>,
+) -> ResultJson {
+    identity(&c)?;
+    if c.description.is_some() {
+        return Err(bad("Runtime description is unsupported"));
+    }
+    let vis = c.visibility.as_deref().unwrap_or("inherit");
+    visibility(vis, true)?;
+    if let Some(i) = c.sync_interval {
+        interval(i)?
+    }
+    Ok(Json(record(sqlx::query("INSERT INTO runtimes(project_id,name,slug,visibility,sync_interval) VALUES(?,?,?,?,COALESCE(?,(SELECT sync_interval FROM settings))) RETURNING *").bind(id).bind(c.name.trim()).bind(c.slug).bind(vis).bind(c.sync_interval).fetch_one(&s.db).await?)))
+}
+async fn update_runtime(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(c): Json<Edit>,
+) -> ResultJson {
+    if c.sync_interval.is_none() && c.visibility.is_none() {
+        return Err(bad("Specify visibility or sync interval"));
+    }
+    if let Some(v) = &c.visibility {
+        visibility(v, true)?
+    }
+    if let Some(i) = c.sync_interval {
+        interval(i)?
+    }
+    Ok(Json(record(sqlx::query("UPDATE runtimes SET visibility=coalesce(?,visibility),sync_interval=coalesce(?,sync_interval) WHERE id=? RETURNING *").bind(c.visibility).bind(c.sync_interval).bind(id).fetch_one(&s.db).await?)))
+}
+async fn runtime(State(s): State<AppState>, Path(id): Path<i64>) -> ResultJson {
+    let mut item=record(sqlx::query("SELECT r.*,p.slug project_slug,p.visibility project_visibility,COALESCE((SELECT state FROM jobs WHERE runtime_id=r.id ORDER BY id DESC LIMIT 1),'idle') status,pub.upstream IS NOT NULL has_upstream,pub.manifest FROM runtimes r JOIN projects p ON p.id=r.project_id LEFT JOIN publications pub ON pub.id=r.active_publication WHERE r.id=?").bind(id).fetch_one(&s.db).await?);
+    item["manifest"] = item["manifest"]
+        .as_str()
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or(Value::Null);
+    item["sources"]=records(sqlx::query("SELECT id,kind,url,mapping,etag,last_modified,last_checked,last_success,status,error FROM sources WHERE runtime_id=? AND enabled=1 ORDER BY id").bind(id).fetch_all(&s.db).await?);
+    item["has_upstream"] = json!(item["has_upstream"].as_i64() == Some(1));
+    let publication = item["active_publication"].as_i64().unwrap_or(-1);
+    item["current_files"] = files(&s, publication).await?;
+    item["originals"] = originals(&s, publication).await?;
+    item["history"]=records(sqlx::query("SELECT id,state,created_at,finished_at,error FROM jobs WHERE runtime_id=? ORDER BY id DESC LIMIT 100").bind(id).fetch_all(&s.db).await?);
+    Ok(Json(item))
+}
+async fn check_source(s: &AppState, id: i64, c: &SourceInput) -> Result<Value, ApiError> {
+    sqlx::query("SELECT id FROM runtimes WHERE id=?")
+        .bind(id)
+        .fetch_one(&s.db)
+        .await?;
+    if c.url.is_some() == c.upload.is_some() {
+        return Err(bad("Supply one manifest URL or uploaded JSON document"));
+    }
+    worker::preview(s, c).await.map_err(|e| bad(&e.to_string()))
+}
+async fn preview(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(c): Json<SourceInput>,
+) -> ResultJson {
+    Ok(Json(check_source(&s, id, &c).await?))
+}
+async fn add_source(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(c): Json<SourceInput>,
+) -> ResultJson {
+    save_source(&s, id, None, c).await
+}
+
+async fn require_idle(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    runtime: i64,
+) -> Result<(), ApiError> {
+    let busy: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE runtime_id=? AND state='running')",
+    )
+    .bind(runtime)
+    .fetch_one(&mut **tx)
+    .await?;
+    if busy {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Wait for the running sync to finish before editing sources".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn save_source(
+    s: &AppState,
+    runtime: i64,
+    replaces: Option<i64>,
+    c: SourceInput,
+) -> ResultJson {
+    check_source(s, runtime, &c).await?;
+    let kind = if c.url.is_some() { "url" } else { "upload" };
+    let mut tx = s.db.begin_with("BEGIN IMMEDIATE").await?;
+    require_idle(&mut tx, runtime).await?;
+    if let Some(old) = replaces {
+        sqlx::query(
+            "UPDATE sources SET enabled=0 WHERE id=? AND runtime_id=? AND enabled=1 RETURNING id",
+        )
+        .bind(old)
+        .bind(runtime)
+        .fetch_one(&mut *tx)
+        .await?;
+    }
+    let id = sqlx::query(
+        "INSERT INTO sources(runtime_id,kind,url,upload,mapping) VALUES(?,?,?,?,?) RETURNING id",
+    )
+    .bind(runtime)
+    .bind(kind)
+    .bind(c.url)
+    .bind(c.upload.map(String::into_bytes))
+    .bind(c.mapping.map(|v| v.to_string()))
+    .fetch_one(&mut *tx)
+    .await?
+    .get::<i64, _>("id");
+    tx.commit().await?;
+    Ok(Json(json!({"id":id,"kind":kind})))
+}
+
+async fn replace_source(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    Json(c): Json<SourceInput>,
+) -> ResultJson {
+    let runtime = sqlx::query_scalar("SELECT runtime_id FROM sources WHERE id=? AND enabled=1")
+        .bind(id)
+        .fetch_one(&s.db)
+        .await?;
+    save_source(&s, runtime, Some(id), c).await
+}
+
+async fn remove_source(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let mut tx = s.db.begin_with("BEGIN IMMEDIATE").await?;
+    let runtime: i64 =
+        sqlx::query_scalar("SELECT runtime_id FROM sources WHERE id=? AND enabled=1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    require_idle(&mut tx, runtime).await?;
+    sqlx::query("UPDATE sources SET enabled=0 WHERE id=?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE jobs SET state='cancelled',finished_at=unixepoch(),error='All sources removed'
+                 WHERE runtime_id=? AND state='queued' AND NOT EXISTS(SELECT 1 FROM sources WHERE runtime_id=? AND enabled=1)")
+        .bind(runtime).bind(runtime).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn sync(State(s): State<AppState>, Path(id): Path<i64>) -> ResultJson {
+    let mut tx = s.db.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("SELECT id FROM runtimes WHERE id=?")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sources WHERE runtime_id=? AND enabled=1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if count == 0 {
+        return Err(bad("Import a source before starting a sync"));
+    }
+    sqlx::query("INSERT OR IGNORE INTO jobs(runtime_id) VALUES(?)")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let job = record(
+        sqlx::query(
+            "SELECT id,state FROM jobs WHERE runtime_id=? AND state IN('queued','running')",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?,
+    );
+    tx.commit().await?;
+    Ok(Json(job))
+}
+async fn transfer_list(s: &AppState) -> Result<Value, sqlx::Error> {
+    Ok(records(sqlx::query("SELECT t.id,t.job_id,t.runtime_id,t.filename,t.host,t.backend,t.state,t.bytes,t.total,t.speed,t.retries,t.retry_at,t.error,p.name project,r.name runtime FROM transfers t JOIN runtimes r ON r.id=t.runtime_id JOIN projects p ON p.id=r.project_id ORDER BY CASE WHEN t.state IN ('completed','failed','cancelled') THEN 1 ELSE 0 END,t.id DESC LIMIT 1000").fetch_all(&s.db).await?))
+}
+async fn transfers(State(s): State<AppState>) -> ResultJson {
+    Ok(Json(transfer_list(&s).await?))
+}
+async fn control(State(s): State<AppState>, Path((id, action)): Path<(i64, String)>) -> ResultJson {
+    let mut tx = s.db.begin_with("BEGIN IMMEDIATE").await?;
+    let row=sqlx::query("SELECT t.state,t.runtime_id,t.command,j.state job_state FROM transfers t JOIN jobs j ON j.id=t.job_id WHERE t.id=?").bind(id).fetch_one(&mut *tx).await?;
+    let state = row.get::<String, _>("state");
+    if row
+        .get::<Option<String>, _>("command")
+        .is_some_and(|pending| pending != action)
+    {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "Another transfer command is pending".into(),
+        ));
+    }
+    match (action.as_str(), state.as_str()) {
+        ("retry", "failed" | "cancelled") => {
+            if matches!(
+                row.get::<String, _>("job_state").as_str(),
+                "queued" | "running"
+            ) {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "Wait for the current sync to finish before retrying".into(),
+                ));
+            }
+            sqlx::query("INSERT OR IGNORE INTO jobs(runtime_id) VALUES(?)")
+                .bind(row.get::<i64, _>("runtime_id"))
+                .execute(&mut *tx)
+                .await?;
+        }
+        ("pause", "queued" | "connecting" | "downloading" | "retrying")
+        | ("resume", "paused")
+        | ("cancel", "queued" | "connecting" | "downloading" | "retrying" | "paused")
+        | ("retry", "retrying") => {
+            sqlx::query("UPDATE transfers SET command=? WHERE id=?")
+                .bind(action)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        _ => {
+            return Err(bad(
+                "This action is unavailable in the current transfer state",
+            ));
+        }
+    }
+    tx.commit().await?;
+    Ok(Json(json!({"accepted":true})))
+}
+async fn events(State(s): State<AppState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // Bound each connection lifetime so the browser periodically reauthenticates.
+    let snapshots = stream::unfold(
+        (s, headers, 0, String::new()),
+        |(s, headers, n, last)| async move {
+            if n >= 30 {
+                return None;
+            }
+            if n > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await
+            }
+            if !crate::access::valid_session(&s.db, &headers).await {
+                return None;
+            }
+            let fresh = transfer_list(&s).await.ok()?.to_string();
+            let event = if fresh != last {
+                Event::default().event("transfers").data(&fresh)
+            } else {
+                Event::default().comment("connected")
+            };
+            Some((Ok::<_, Infallible>(event), (s, headers, n + 1, fresh)))
+        },
+    );
+    Sse::new(snapshots).keep_alive(KeepAlive::default())
+}
+#[derive(Deserialize)]
+struct ArchivePage {
+    before: Option<i64>,
+}
+async fn archive(State(s): State<AppState>, Query(page): Query<ArchivePage>) -> ResultJson {
+    let mut rows = Vec::new();
+    for row in sqlx::query("SELECT pub.id,p.id project_id,r.id runtime_id,p.name project,r.name runtime,pub.created_at,pub.manifest FROM publications pub JOIN runtimes r ON r.id=pub.runtime_id JOIN projects p ON p.id=r.project_id WHERE pub.id IS NOT r.active_publication AND (? IS NULL OR pub.id < ?) ORDER BY pub.id DESC LIMIT 100").bind(page.before).bind(page.before).fetch_all(&s.db).await? {
+        let id:i64=row.get("id");let mut item=record(row);
+        item["manifest"]=serde_json::from_str(item["manifest"].as_str().unwrap_or("null")).unwrap_or_default();
+        item["files"]=files(&s,id).await?;item["originals"]=originals(&s,id).await?;
+        rows.push(item)
+    }
+    Ok(Json(json!(rows)))
+}
+
+struct Usage {
+    modified: SystemTime,
+    scanned: Instant,
+    bytes: u64,
+}
+#[derive(Clone, Default)]
+struct Storage(Arc<Mutex<Option<Usage>>>);
+
+impl Storage {
+    // Completed objects are immutable. Adding, replacing or removing an object changes the
+    // directory mtime. Periodically rescan even when its filesystem has coarse timestamps.
+    async fn bytes(self, dir: PathBuf) -> Result<u64, ApiError> {
+        let scan = tokio::task::spawn_blocking(move || -> io::Result<u64> {
+            let mut cache = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("Storage cache unavailable"))?;
+            let modified = fs::metadata(&dir)?.modified()?;
+            if let Some(last) = cache.as_ref()
+                && last.modified == modified
+                && last.scanned.elapsed() < Duration::from_secs(30)
+            {
+                return Ok(last.bytes);
+            }
+            let mut bytes = 0u64;
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name.len() != 64
+                    || !name
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+                {
+                    continue;
+                }
+                match entry.metadata() {
+                    Ok(m) if m.is_file() => bytes = bytes.saturating_add(m.len()),
+                    Ok(_) => (),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                    Err(e) => return Err(e),
+                }
+            }
+            if fs::metadata(&dir)?.modified()? == modified {
+                *cache = Some(Usage {
+                    modified,
+                    scanned: Instant::now(),
+                    bytes,
+                });
+            }
+            Ok(bytes)
+        })
+        .await;
+        scan.ok().and_then(Result::ok).ok_or_else(|| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not inspect artifact storage".into(),
+            )
+        })
+    }
+}
+async fn overview(State(s): State<AppState>, Extension(storage): Extension<Storage>) -> ResultJson {
+    let mut item=record(sqlx::query("SELECT (SELECT COUNT(*) FROM projects) projects,(SELECT COUNT(*) FROM runtimes) runtimes,(SELECT COUNT(*) FROM transfers WHERE state IN ('connecting','downloading','verifying')) active,(SELECT COUNT(*) FROM transfers WHERE state='queued') queued,(SELECT MAX(last_success) FROM runtimes) last_success,(SELECT COUNT(DISTINCT r.project_id) FROM runtimes r WHERE (SELECT state FROM jobs WHERE runtime_id=r.id ORDER BY id DESC LIMIT 1)='failed') attention,engine FROM settings").fetch_one(&s.db).await?);
+    item["storage_bytes"] = json!(storage.bytes(s.data.join("artifacts")).await?);
+    item["activity"]=records(sqlx::query("SELECT j.id,p.name project,r.name runtime,j.state,j.created_at,j.error FROM jobs j JOIN runtimes r ON r.id=j.runtime_id JOIN projects p ON p.id=r.project_id ORDER BY j.id DESC LIMIT 30").fetch_all(&s.db).await?);
+    Ok(Json(item))
+}
+async fn curl_available() -> bool {
+    tokio::process::Command::new("curl")
+        .arg("--version")
+        .output()
+        .await
+        .is_ok_and(|o| o.status.success())
+}
+async fn settings(State(s): State<AppState>, Extension(storage): Extension<Storage>) -> ResultJson {
+    let mut item = record(
+        sqlx::query("SELECT engine,concurrency,per_host,retries,sync_interval FROM settings")
+            .fetch_one(&s.db)
+            .await?,
+    );
+    item["storage_bytes"] = json!(storage.bytes(s.data.join("artifacts")).await?);
+    item["version"] = json!(env!("CARGO_PKG_VERSION"));
+    item["public_url"] = json!(s.public_url);
+    item["curl_available"] = json!(curl_available().await);
+    Ok(Json(item))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Settings {
+    engine: String,
+    concurrency: i64,
+    per_host: i64,
+    retries: i64,
+    sync_interval: i64,
+}
+async fn update_settings(
+    State(s): State<AppState>,
+    storage: Extension<Storage>,
+    Json(c): Json<Settings>,
+) -> ResultJson {
+    if !matches!(c.engine.as_str(), "native" | "curl")
+        || c.engine == "curl" && !curl_available().await
+    {
+        return Err(bad("Download engine unavailable"));
+    }
+    interval(c.sync_interval)?;
+    if !(1..=32).contains(&c.concurrency)
+        || !(1..=c.concurrency).contains(&c.per_host)
+        || !(0..=12).contains(&c.retries)
+    {
+        return Err(bad(
+            "Use 1–32 connections, a per-host limit within that total, and 0–12 retries",
+        ));
+    }
+    sqlx::query("UPDATE settings SET engine=?,concurrency=?,per_host=?,retries=?,sync_interval=? WHERE id=1").bind(c.engine).bind(c.concurrency).bind(c.per_host).bind(c.retries).bind(c.sync_interval).execute(&s.db).await?;
+    settings(State(s), storage).await
+}
+
+async fn files(s: &AppState, id: i64) -> Result<Value, sqlx::Error> {
+    Ok(records(sqlx::query("SELECT id,release,filename,size,source_url,digest FROM files WHERE publication_id=? ORDER BY release,filename").bind(id).fetch_all(&s.db).await?))
+}
+
+async fn originals(s: &AppState, id: i64) -> Result<Value, sqlx::Error> {
+    Ok(records(sqlx::query("SELECT o.id,o.source_id,o.page,o.url,o.digest,length(d.body) size FROM publication_sources ps JOIN source_observations o ON o.id=ps.observation_id JOIN raw_documents d ON d.digest=o.digest WHERE ps.publication_id=? ORDER BY o.source_id,o.page").bind(id).fetch_all(&s.db).await?))
+}
+async fn original(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let body: Vec<u8> = sqlx::query_scalar(
+        "SELECT d.body FROM source_observations o JOIN raw_documents d USING(digest) WHERE o.id=?",
+    )
+    .bind(id)
+    .fetch_one(&s.db)
+    .await?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=source.json",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    ))
+}
