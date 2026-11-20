@@ -136,7 +136,7 @@ function Workspace({
     [toast, setToast] = useState(""),
     [logout, setLogout] = useState(false);
   const settings = useResource<Configuration>("settings");
-  const project = useResource<Project[]>("projects", {
+  const project = useResource<Project>("projects/" + route[1], {
     enabled: section === "projects" && !!route[1],
   });
   const runtime = useResource<Detail>("runtimes/" + route[3], {
@@ -230,8 +230,7 @@ function Workspace({
                 <>
                   <ChevronRight size={12} />
                   <a href={"#projects/" + route[1]}>
-                    {project.data?.find((p) => String(p.id) === route[1])
-                      ?.name || "Project"}
+                    {project.data?.name || "Project"}
                   </a>
                 </>
               )}

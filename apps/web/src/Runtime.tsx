@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { useMutation } from "@tanstack/react-query";
 import {
   Braces,
   Clock,
@@ -8,7 +7,6 @@ import {
   FileUp,
   GitFork,
   History,
-  Layers3,
   Link2,
   Pencil,
   Plus,
@@ -18,11 +16,9 @@ import {
 } from "lucide-react";
 import { api, useAction, useResource } from "./api";
 import {
-  bytes,
   date,
   type ArchiveFile,
   type Detail,
-  type Manifest,
   type Project,
   type Settings,
   type Source,
@@ -42,220 +38,12 @@ import {
   str,
   useNotice,
 } from "./ui";
-import { Originals } from "./Archive";
+import { Originals, ParkingAction } from "./Archive";
+import { ImportSource, ManifestView } from "./SourceImport";
+import { PublicationHistory } from "./PublicationHistory";
+import { FileHistory, PastFiles } from "./FileHistory";
 import { ActivityRows } from "./Overview";
 
-const fields = [
-  ["releases_path", "Release list", "/releases"],
-  ["version_path", "Release version", "/version"],
-  ["artifacts_path", "Artifact list", "/artifacts"],
-  ["url_path", "Artifact URL", "/url"],
-  ["filename_path", "Filename", "/filename"],
-  ["size_path", "Size in bytes", "/size"],
-  ["sha256_path", "SHA-256", "/sha256"],
-  ["next_path", "Next page URL", "/next"],
-] as const;
-type Input = {
-  url?: string;
-  upload?: string;
-  mapping?: Record<string, string>;
-};
-function ImportSource({
-  id,
-  onClose,
-  source,
-}: {
-  id: number;
-  onClose: () => void;
-  source?: Source;
-}) {
-  const existingMapping: Record<string, string> =
-    typeof source?.mapping === "string"
-      ? JSON.parse(source.mapping)
-      : source?.mapping || {};
-  const [kind, setKind] = useState<"Remote URL" | "Upload JSON">(
-      source?.kind === "upload" ? "Upload JSON" : "Remote URL",
-    ),
-    [useMapping, setUseMapping] = useState(
-      Object.keys(existingMapping).length > 0,
-    ),
-    [preview, setPreview] = useState<{
-      input: Input;
-      manifest: Manifest;
-    } | null>(null);
-  const notice = useNotice();
-  const check = useMutation({
-    mutationFn: async (data: FormData) => {
-      let input: Input;
-      if (kind === "Remote URL") input = { url: str(data, "url").trim() };
-      else {
-        const file = data.get("file");
-        if (!(file instanceof File) || !file.size)
-          throw new Error("Select a JSON file.");
-        input = { upload: await file.text() };
-      }
-      if (useMapping) {
-        const mapping: Record<string, string> = {};
-        for (const [key] of fields) {
-          const value = str(data, key).trim();
-          if (value) mapping[key] = value === "$" ? "" : value;
-        }
-        input.mapping = mapping;
-      }
-      const manifest = await api<Manifest>(
-        `runtimes/${id}/preview`,
-        "POST",
-        input,
-      );
-      return { input, manifest };
-    },
-    onSuccess: setPreview,
-  });
-  const save = useAction(
-    () =>
-      api(
-        source ? `sources/${source.id}` : `runtimes/${id}/sources`,
-        source ? "PATCH" : "POST",
-        preview!.input,
-      ),
-    () => {
-      notice(source ? "Source updated" : "Source imported");
-      onClose();
-    },
-  );
-  return (
-    <Dialog
-      title={
-        preview ? "Review source" : source ? "Edit source" : "Import source"
-      }
-      desc={
-        preview
-          ? "Review the normalized release inventory before importing."
-          : "Import an upstream manifest from a URL or a JSON file."
-      }
-      onClose={onClose}
-      busy={check.isPending || save.isPending}
-    >
-      <div hidden={!!preview}>
-        <Form
-          submit="Preview manifest"
-          onSubmit={check.mutate}
-          busy={check.isPending}
-          error={check.error}
-        >
-          <fieldset disabled={check.isPending}>
-            <Tabs
-              items={["Remote URL", "Upload JSON"] as const}
-              current={kind}
-              onChange={setKind}
-            />
-            {kind === "Remote URL" ? (
-              <Field label="Manifest URL">
-                <input
-                  name="url"
-                  type="url"
-                  defaultValue={source?.url || ""}
-                  required
-                  placeholder="https://releases.example.org/manifest.json"
-                />
-              </Field>
-            ) : (
-              <Field label="Manifest file">
-                <input
-                  name="file"
-                  type="file"
-                  accept=".json,application/json"
-                  required
-                />
-              </Field>
-            )}
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={useMapping}
-                onChange={(e) => setUseMapping(e.target.checked)}
-              />{" "}
-              Customize JSON field mapping
-            </label>
-            {useMapping && (
-              <>
-                <p className="hint">
-                  Use JSON pointers or dotted paths. Leave a field blank for
-                  automatic detection, or enter $ to select the current value.
-                </p>
-                <div className="field-grid">
-                  {fields.map(([k, label, placeholder]) => (
-                    <Field key={k} label={label}>
-                      <input
-                        name={k}
-                        defaultValue={
-                          existingMapping[k] === "" ? "$" : existingMapping[k]
-                        }
-                        placeholder={placeholder}
-                      />
-                    </Field>
-                  ))}
-                </div>
-              </>
-            )}
-          </fieldset>
-        </Form>
-      </div>
-      {preview && (
-        <Form
-          submit={source ? "Save source" : "Import source"}
-          onSubmit={save.mutate}
-          busy={save.isPending}
-          error={save.error}
-          secondary={
-            <button
-              className="btn"
-              type="button"
-              onClick={() => setPreview(null)}
-            >
-              Back to source
-            </button>
-          }
-        >
-          <ManifestView manifest={preview.manifest} />
-        </Form>
-      )}
-    </Dialog>
-  );
-}
-function ManifestView({ manifest }: { manifest: Manifest }) {
-  const releases = manifest.releases;
-  return (
-    <div className="manifest-list">
-      <div className="inventory-summary">
-        <Layers3 size={16} />
-        {releases.length} releases <span>·</span>{" "}
-        {releases.reduce((n, r) => n + r.artifacts.length, 0)} artifacts
-      </div>
-      {releases.map((r, i) => (
-        <details key={r.version + i} open={releases.length === 1}>
-          <summary>
-            {r.version}
-            <span>{r.artifacts.length} files</span>
-          </summary>
-          {r.artifacts.map((a, j) => (
-            <div className="artifact" key={j}>
-              <FileJson size={16} />
-              <div>
-                <strong>{a.filename}</strong>
-                <small className="mono wrap">{a.url}</small>
-                {a.sha256 && (
-                  <small className="mono wrap">SHA-256 {a.sha256}</small>
-                )}
-              </div>
-              <small>{bytes(a.size)}</small>
-            </div>
-          ))}
-        </details>
-      ))}
-    </div>
-  );
-}
 function RuntimeSettings({ r, onClose }: { r: Detail; onClose: () => void }) {
   const notice = useNotice();
   const save = useAction(
@@ -306,7 +94,9 @@ function RuntimeSettings({ r, onClose }: { r: Detail; onClose: () => void }) {
 const runtimeTabs = ["Sources", "Publication", "Sync history"] as const;
 type Extended = Detail & {
   current_files?: ArchiveFile[];
+  has_past_files?: boolean;
   has_upstream?: boolean;
+  active_publication?: number | null;
 };
 export function RuntimeView({ id, project }: { id: number; project: Project }) {
   const query = useResource<Extended>("runtimes/" + id, {
@@ -314,10 +104,13 @@ export function RuntimeView({ id, project }: { id: number; project: Project }) {
     }),
     settings = useResource<Settings>("settings");
   const [tab, setTab] = useState<(typeof runtimeTabs)[number]>("Sources"),
-    [modal, setModal] = useState<"import" | "settings" | null>(null),
+    [modal, setModal] = useState<
+      "import" | "settings" | "past-files" | "publications" | null
+    >(null),
     notice = useNotice();
   const [editing, setEditing] = useState<Source | null>(null),
     [deleting, setDeleting] = useState<Source | null>(null);
+  const [fileHistory, setFileHistory] = useState<ArchiveFile | null>(null);
   const remove = useAction(
     () => api("sources/" + deleting!.id, "DELETE"),
     () => {
@@ -334,6 +127,11 @@ export function RuntimeView({ id, project }: { id: number; project: Project }) {
       {(r) => {
         if (r.project_slug !== project.slug)
           return <Empty title="Runtime unavailable" />;
+        const parked = !!(
+          r.parked_at ||
+          r.project_parked_at ||
+          project.parked_at
+        );
         const path = `/p/${encodeURIComponent(project.slug)}/r/${encodeURIComponent(r.slug)}`,
           publicOrigin = settings.data?.public_url || window.location.origin;
         return (
@@ -343,24 +141,53 @@ export function RuntimeView({ id, project }: { id: number; project: Project }) {
               desc={project.name + " / " + r.slug}
               actions={
                 <>
-                  <button className="btn" onClick={() => setModal("settings")}>
-                    <Settings2 />
-                    Settings
-                  </button>
-                  <button
-                    className="btn primary"
-                    disabled={sync.isPending || !r.sources.length}
-                    onClick={() => sync.mutate(new FormData())}
-                  >
-                    <RefreshCw />
-                    Sync now
-                  </button>
+                  {r.project_parked_at || project.parked_at ? (
+                    <a className="btn" href={"#projects/" + project.id}>
+                      View parked project
+                    </a>
+                  ) : (
+                    <ParkingAction
+                      kind="runtime"
+                      id={id}
+                      name={r.name}
+                      restore={!!r.parked_at}
+                    />
+                  )}
+                  {!parked && (
+                    <button
+                      className="btn"
+                      onClick={() => setModal("settings")}
+                    >
+                      <Settings2 />
+                      Settings
+                    </button>
+                  )}
+                  {!parked && (
+                    <button
+                      className="btn primary"
+                      disabled={sync.isPending || !r.sources.length}
+                      onClick={() => sync.mutate(new FormData())}
+                    >
+                      <RefreshCw />
+                      Sync now
+                    </button>
+                  )}
                 </>
               }
             />
             <Problem error={sync.error} />
             <div className="runtime-strip">
-              <Status value={r.status} />
+              <Status value={parked ? "parked" : r.status} />
+              {parked && (
+                <span>
+                  {r.project_parked_at || project.parked_at
+                    ? "Project parked"
+                    : "Runtime parked"}{" "}
+                  {date(
+                    r.project_parked_at || project.parked_at || r.parked_at,
+                  )}
+                </span>
+              )}
               <span>
                 <Clock />
                 Every {r.sync_interval.toLocaleString()}s
@@ -375,13 +202,15 @@ export function RuntimeView({ id, project }: { id: number; project: Project }) {
                 title="Manifest sources"
                 icon={GitFork}
                 action={
-                  <button
-                    className="btn small"
-                    onClick={() => setModal("import")}
-                  >
-                    <Plus size={14} />
-                    Import source
-                  </button>
+                  !parked && (
+                    <button
+                      className="btn small"
+                      onClick={() => setModal("import")}
+                    >
+                      <Plus size={14} />
+                      Import source
+                    </button>
+                  )
                 }
               >
                 {r.sources.length ? (
@@ -406,27 +235,29 @@ export function RuntimeView({ id, project }: { id: number; project: Project }) {
                             </small>
                           </div>
                           <Status value={s.status} />
-                          <div className="row-actions">
-                            <button
-                              className="icon-btn"
-                              aria-label={"Edit source " + s.id}
-                              title="Edit source"
-                              onClick={() => setEditing(s)}
-                            >
-                              <Pencil size={15} />
-                            </button>
-                            <button
-                              className="icon-btn"
-                              aria-label={"Remove source " + s.id}
-                              title="Remove source"
-                              onClick={() => {
-                                remove.reset();
-                                setDeleting(s);
-                              }}
-                            >
-                              <Trash2 size={15} />
-                            </button>
-                          </div>
+                          {!parked && (
+                            <div className="row-actions">
+                              <button
+                                className="icon-btn"
+                                aria-label={"Edit source " + s.id}
+                                title="Edit source"
+                                onClick={() => setEditing(s)}
+                              >
+                                <Pencil size={15} />
+                              </button>
+                              <button
+                                className="icon-btn"
+                                aria-label={"Remove source " + s.id}
+                                title="Remove source"
+                                onClick={() => {
+                                  remove.reset();
+                                  setDeleting(s);
+                                }}
+                              >
+                                <Trash2 size={15} />
+                              </button>
+                            </div>
+                          )}
                         </div>
                         <dl className="metadata">
                           <div>
@@ -476,7 +307,13 @@ export function RuntimeView({ id, project }: { id: number; project: Project }) {
             {tab === "Publication" && (
               <>
                 <Panel title="Published endpoints" icon={Link2}>
-                  {r.manifest ? (
+                  {parked ? (
+                    <Empty
+                      icon={Link2}
+                      title="Publication parked"
+                      desc="Restore this resource to make its mirror endpoints available again."
+                    />
+                  ) : r.manifest ? (
                     <div className="endpoints">
                       {[
                         "manifest.json",
@@ -522,7 +359,11 @@ export function RuntimeView({ id, project }: { id: number; project: Project }) {
                 </Panel>
                 {r.manifest && (
                   <Panel title="Published manifest" icon={Braces}>
-                    <ManifestView manifest={r.manifest} />
+                    <ManifestView
+                      manifest={r.manifest}
+                      files={r.current_files}
+                      onInspect={setFileHistory}
+                    />
                     <details className="json">
                       <summary>View manifest JSON</summary>
                       <pre>{JSON.stringify(r.manifest, null, 2)}</pre>
@@ -534,8 +375,23 @@ export function RuntimeView({ id, project }: { id: number; project: Project }) {
                     <Originals items={r.originals} />
                   </Panel>
                 )}
-                {!!r.current_files?.length && (
-                  <Panel title="Artifact provenance" icon={GitFork}>
+                {(!!r.current_files?.length || r.has_past_files) && (
+                  <Panel
+                    title="Published files"
+                    icon={GitFork}
+                    sub="Select a filename to inspect its revisions or download an earlier copy."
+                    action={
+                      r.has_past_files && (
+                        <button
+                          className="btn small"
+                          onClick={() => setModal("past-files")}
+                        >
+                          <History size={14} />
+                          Past files
+                        </button>
+                      )
+                    }
+                  >
                     <div className="table-scroll">
                       <table>
                         <thead>
@@ -546,10 +402,16 @@ export function RuntimeView({ id, project }: { id: number; project: Project }) {
                           </tr>
                         </thead>
                         <tbody>
-                          {r.current_files.map((f) => (
+                          {r.current_files?.map((f) => (
                             <tr key={f.id}>
                               <td>
-                                <strong>{f.filename}</strong>
+                                <button
+                                  className="text-button file-link"
+                                  onClick={() => setFileHistory(f)}
+                                >
+                                  <History size={14} />
+                                  {f.filename}
+                                </button>
                                 <small>{f.release}</small>
                               </td>
                               <td className="wrap">{f.source_url}</td>
@@ -564,9 +426,38 @@ export function RuntimeView({ id, project }: { id: number; project: Project }) {
               </>
             )}
             {tab === "Sync history" && (
-              <Panel title="Sync history" icon={History}>
+              <Panel
+                title="Sync history"
+                icon={History}
+                action={
+                  r.active_publication ? (
+                    <button
+                      className="btn small"
+                      onClick={() => setModal("publications")}
+                    >
+                      <History size={14} />
+                      Publication history
+                    </button>
+                  ) : undefined
+                }
+              >
                 <ActivityRows rows={r.history} />
               </Panel>
+            )}
+            {modal === "publications" && (
+              <PublicationHistory
+                runtimeId={id}
+                onClose={() => setModal(null)}
+              />
+            )}
+            {modal === "past-files" && (
+              <PastFiles runtimeId={id} onClose={() => setModal(null)} />
+            )}
+            {fileHistory && (
+              <FileHistory
+                file={fileHistory}
+                onClose={() => setFileHistory(null)}
+              />
             )}
             {modal === "import" && (
               <ImportSource id={id} onClose={() => setModal(null)} />
@@ -592,8 +483,8 @@ export function RuntimeView({ id, project }: { id: number; project: Project }) {
                   error={remove.error}
                 >
                   <p>
-                    Future syncs will exclude this source. Its published
-                    snapshots stay in the archive.
+                    Future syncs will exclude this source. Files already
+                    mirrored keep their published URLs.
                   </p>
                 </Form>
               </Dialog>

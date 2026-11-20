@@ -245,6 +245,7 @@ export function Form({
   error,
   busy,
   secondary,
+  disabled,
 }: {
   children: ReactNode;
   submit: string;
@@ -252,10 +253,11 @@ export function Form({
   error?: unknown;
   busy?: boolean;
   secondary?: ReactNode;
+  disabled?: boolean;
 }) {
   function handle(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (!busy) onSubmit(new FormData(e.currentTarget));
+    if (!busy && !disabled) onSubmit(new FormData(e.currentTarget));
   }
   return (
     <form className="form" onSubmit={handle}>
@@ -263,7 +265,11 @@ export function Form({
       <Problem error={error} />
       <div className="form-foot">
         {secondary}
-        <button type="submit" className="btn primary" disabled={busy}>
+        <button
+          type="submit"
+          className="btn primary"
+          disabled={busy || disabled}
+        >
           {busy && <LoaderCircle size={16} className="spin" />}
           {submit}
         </button>
@@ -337,6 +343,7 @@ export function Tabs<T extends string>({
       {items.map((item) => (
         <button
           key={item}
+          type="button"
           className={item === current ? "selected" : ""}
           aria-pressed={item === current}
           onClick={() => onChange(item)}
