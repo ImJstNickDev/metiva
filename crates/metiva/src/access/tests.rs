@@ -334,6 +334,16 @@ async fn scope_discovery_publication_and_file_handoffs() {
             .collect();
         assert_eq!(slugs, expected);
     }
+    for collection in [
+        "/api/v1/projects/restricted/runtimes",
+        "/api/v1/projects/unknown/runtimes",
+        "/p/restricted/r/stable/manifest.json",
+        "/p/unknown/r/unknown/manifest.json",
+    ] {
+        let reply = f.request(Method::GET, collection, &[], None).await;
+        assert_eq!(reply.status, 401);
+        assert_eq!(reply.body["error"], "Bearer credential required");
+    }
     let grant = [("authorization", key.as_str())];
     let list = f
         .request(

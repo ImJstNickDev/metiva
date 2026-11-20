@@ -58,6 +58,7 @@ struct Grant {
     scope: String,
     project_id: Option<i64>,
     runtime_id: Option<i64>,
+    last_used_at: Option<i64>,
 }
 
 struct Reader(Option<Grant>);
@@ -67,10 +68,24 @@ impl Reader {
         let Some(raw) = bearer(h)? else {
             return Ok(Self(None));
         };
-        let grant=sqlx::query_as(
-            "UPDATE api_keys SET last_used_at=unixepoch() WHERE digest=? AND revoked_at IS NULL RETURNING scope,project_id,runtime_id")
-            .bind(digest(raw)).fetch_optional(&state.db).await?.ok_or(Error(StatusCode::UNAUTHORIZED,"Invalid bearer credential"))?;
+        let hash = digest(raw);
+        let grant: Grant = sqlx::query_as("SELECT scope,project_id,runtime_id,last_used_at FROM api_keys WHERE digest=? AND revoked_at IS NULL")
+            .bind(&hash).fetch_optional(&state.db).await?.ok_or(Error(StatusCode::UNAUTHORIZED, "Invalid bearer credential"))?;
+        if grant
+            .last_used_at
+            .is_none_or(|last| last < crate::unix_time() - 60)
+        {
+            sqlx::query("UPDATE api_keys SET last_used_at=unixepoch() WHERE digest=? AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at<unixepoch()-60)")
+                .bind(hash).execute(&state.db).await?;
+        }
         Ok(Self(Some(grant)))
+    }
+    fn undiscovered(&self) -> Error {
+        if self.0.is_some() {
+            missing()
+        } else {
+            Error(StatusCode::UNAUTHORIZED, "Bearer credential required")
+        }
     }
     fn allows(&self, project: i64, runtime: Option<i64>, public: bool) -> bool {
         public
@@ -153,7 +168,7 @@ async fn runtimes(
             .bind(project)
             .fetch_optional(&state.db)
             .await?
-            .ok_or_else(missing)?;
+            .ok_or_else(|| reader.undiscovered())?;
     reader.check(id, None, visibility == "public")?;
     let mut list: Vec<Runtime> = sqlx::query_as(runtime_query!("r.project_id=? ORDER BY r.slug"))
         .bind(id)
@@ -175,7 +190,7 @@ async fn authorized_runtime(
         .bind(runtime)
         .fetch_optional(&state.db)
         .await?
-        .ok_or_else(missing)?;
+        .ok_or_else(|| reader.undiscovered())?;
     reader.check(r.project_id, Some(r.id), r.public)?;
     Ok(r)
 }
