@@ -45,6 +45,17 @@ pub async fn open(data: &Path, origin: &str) -> Result<AppState> {
     for dir in ["db", "artifacts", "staging", "manifests"] {
         tokio::fs::create_dir_all(data.join(dir)).await?;
     }
+    let lock_path = data.join("db/migrations.lock");
+    let _migration_lock = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(file)
+    })
+    .await??;
     let options = SqliteConnectOptions::new()
         .filename(data.join("db/metiva.sqlite3"))
         .create_if_missing(true)

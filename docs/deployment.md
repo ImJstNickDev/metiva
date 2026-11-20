@@ -2,9 +2,9 @@
 
 ## Storage and process ownership
 
-Set `METIVA_DATA_DIR` to a local filesystem on the Docker host. The directory holds the database, its WAL and shared-memory files, the object store, temporary downloads and the initial bootstrap secret. Staging and artifacts must support hard links on the same filesystem. Keep the parent private to the deployment account. Allow the ingress worker to read completed objects and traverse its read-only `artifacts` mount.
+Set `METIVA_DATA_DIR` to a local filesystem on the Docker host. The directory holds the database, its WAL and shared-memory files, the object store, temporary downloads and the initial bootstrap secret. Keep staging and artifacts on one filesystem for atomic promotion. Keep the parent private to the deployment account. Allow the ingress worker to read completed objects and traverse its read-only `artifacts` mount.
 
-The API initializes the schema before the worker starts. Both processes use the same numeric UID and GID and enable foreign keys, full synchronous commits, WAL and a 15-second busy timeout. A filesystem lock admits one worker per data directory. A unique partial index admits one queued or running sync per runtime. Artifact bodies stay outside SQLite. The database contains original source bytes, release records and publication membership.
+The API initializes the schema before the worker starts. A shared migration lock also serializes concurrent command-line starts. Both processes use the same numeric UID and GID and enable foreign keys, full synchronous commits, WAL and a 15-second busy timeout. A filesystem lock admits one worker per data directory. A unique partial index admits one queued or running sync per runtime. Artifact bodies stay outside SQLite. The database contains original source bytes, release records and publication membership.
 
 The backend bridge defaults to `10.243.62.0/28`. Set `METIVA_BACKEND_SUBNET` to a free local subnet if it overlaps another route. The bridge permits outbound source inspection and downloads. Only the ingress joins `prod-frontend`. Configure the external reverse proxy for HTTPS and disable response caching on mirror and API paths. The API uses the configured origin to construct URLs. It does not derive trust or scheme from forwarded headers.
 
