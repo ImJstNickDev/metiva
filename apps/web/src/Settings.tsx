@@ -1,11 +1,5 @@
 import { useState } from "react";
-import {
-  Bolt,
-  KeyRound,
-  Server,
-  ShieldCheck,
-  SlidersHorizontal,
-} from "lucide-react";
+import { KeyRound, Server, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { useMutation } from "@tanstack/react-query";
 import { api, signedOut, useAction, useResource } from "./api";
 import { bytes, type Session, type Settings as Configuration } from "./model";

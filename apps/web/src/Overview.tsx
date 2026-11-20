@@ -20,6 +20,7 @@ import {
   type Activity,
   type Overview as Summary,
   type Project,
+  type Settings,
 } from "./model";
 import { Data, Empty, Head, More, Panel, Status } from "./ui";
 import { ProjectDialog } from "./Projects";
@@ -63,6 +64,7 @@ export function ActivityRows({ rows }: { rows: Activity[] }) {
 export function Overview() {
   const overview = useResource<Summary>("overview", { refetchInterval: 10000 });
   const projects = useResource<Project[]>("projects");
+  const settings = useResource<Settings>("settings");
   const [newProject, setNewProject] = useState(false);
   return (
     <>
@@ -171,6 +173,29 @@ export function Overview() {
                   </span>
                   <strong>{bytes(o.storage_bytes)}</strong>
                 </div>
+                {settings.data && (
+                  <div className="capacity">
+                    <div className="inline space">
+                      <strong>Transfer capacity</strong>
+                      <More href="#settings" label="Settings" />
+                    </div>
+                    <div className="slot-list" aria-hidden="true">
+                      {Array.from(
+                        { length: settings.data.concurrency },
+                        (_, index) => (
+                          <i
+                            key={index}
+                            className={index < o.active ? "used" : ""}
+                          />
+                        ),
+                      )}
+                    </div>
+                    <small>
+                      {o.active} active · {settings.data.concurrency} concurrent
+                      slots
+                    </small>
+                  </div>
+                )}
               </Panel>
             </div>
             <Panel

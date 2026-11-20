@@ -14,7 +14,6 @@ import {
   LogOut,
   Menu,
   Moon,
-  PanelLeft,
   Server,
   Settings2,
   Sun,
@@ -99,7 +98,7 @@ function Side({
       <div className="side-bottom">
         <div className="instance-version">
           <Server size={16} />
-          <span>Self-hosted instance</span>
+          <span>Self-hosted</span>
           {version && <code>v{version}</code>}
         </div>
         <div className="side-account">
