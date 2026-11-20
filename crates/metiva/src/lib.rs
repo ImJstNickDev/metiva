@@ -75,6 +75,7 @@ pub async fn open(data: &Path, origin: &str) -> Result<AppState> {
         .connect_with(options)
         .await?;
     sqlx::migrate!("./migrations").run(&db).await?;
+    worker::inventory::migrate_legacy(&db).await?;
     Ok(AppState {
         db,
         data: data.into(),

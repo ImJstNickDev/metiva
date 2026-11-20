@@ -12,31 +12,28 @@ Metiva mirrors artifacts from JSON release feeds. Inspect a feed, start a sync, 
 
 ## Run a mirror
 
-Use a Linux host with Docker Compose, local disk storage and an existing external Docker network named `prod-frontend`. Run these commands from the checkout as the account that will own the data.
+Download the production Compose file into a new directory on a Linux amd64 host. It runs three services from two versioned images and publishes the dashboard and mirror on port **8088**. Run the commands as the account that owns the data.
 
 ```sh
-git clone https://github.com/ImJstNickDev/metiva.git
-cd metiva
-cp .env.example .env
+mkdir metiva && cd metiva
+curl --fail --location --output compose-prod.yaml \
+  https://github.com/ImJstNickDev/metiva/releases/download/v0.1.2/compose-prod.yaml
 install -d -m 700 data
 install -d -m 755 data/artifacts
-```
-
-Set `METIVA_PUBLIC_URL` in `.env` to your external HTTPS origin. Set `METIVA_UID` and `METIVA_GID` to the numbers printed by `id -u` and `id -g`. When using a different data directory, create its `artifacts` subdirectory before starting.
-
-```sh
-docker compose config --quiet
-docker compose up -d --build
-docker compose ps
+printf 'METIVA_UID=%s\nMETIVA_GID=%s\n' "$(id -u)" "$(id -g)" > .env
+docker compose -f compose-prod.yaml pull
+docker compose -f compose-prod.yaml up -d --wait
 cat data/bootstrap-secret
 ```
 
-In Nginx Proxy Manager, create a proxy host for the configured domain. Select **HTTP**, forward to **metiva** on port **80**, and enable HTTPS on the public host. Open the dashboard over HTTPS. Enter the local bootstrap secret and choose the administrator username and password. Setup consumes the secret.
+Open `http://localhost:8088` on the host, enter the bootstrap secret and choose an administrator password. For remote access, set `METIVA_PUBLIC_URL` to the public HTTPS origin in `.env`, forward your reverse proxy to the host's HTTP port 8088, and recreate the services. Set `METIVA_PORT` to use another port or `METIVA_BIND_ADDRESS=127.0.0.1` to bind only to loopback.
+
+For source builds and deployments on an existing external proxy network, use the repository's `compose.yaml`. [Deployment and upgrades](docs/deployment.md)
 
 ## Publish a runtime
 
 1. In **Projects**, create a project and a runtime. Choose visibility explicitly when you want anonymous downloads.
-2. Import a manifest URL or upload JSON. Choose a release list or linked index, select the channels and artifact groups to follow, then preview the exact files and known download size. Edit that selection later to include new platforms or channels.
+2. Import a manifest URL or upload JSON. Select a release list, filter records and inspect a sample. Follow linked documents to the files you want, or use the linked-index picker for channel and platform maps. Preview the files and known download size before saving.
 3. Add the source and start synchronization. **Transfers** shows observed bytes, verification and retries.
 4. Copy the published endpoint from the runtime. Consumers can fetch the manifest at `/p/{project}/r/{runtime}/manifest.json`. A compatible single feed can also provide `upstream.json`.
 5. Select a filename in **Publication** for its revision timeline. A verified correction takes over its existing URL. An administrator can download earlier bytes from the timeline.
@@ -65,7 +62,7 @@ python3 tests/compose/run.py
 
 The Compose test creates a temporary data directory, test origin and TLS proxy. It exercises publication, interrupted transfer recovery, archive access and credential rotation end to end. It requires Docker with Compose v2.24+ and OpenSSL.
 
-Versioned Linux amd64 ingress and service images are published to GHCR and Docker Hub. [Deploy prebuilt images](docs/deployment.md#versioned-images)
+Versioned Linux amd64 ingress and service images are published to GHCR and Docker Hub. [Deploy prebuilt images](docs/deployment.md#versioned-images) · [Changelog](CHANGELOG.md)
 
 The [contributor guide](CONTRIBUTING.md) covers local API, worker and dashboard development.
 

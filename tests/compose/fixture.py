@@ -33,6 +33,9 @@ class Origin(BaseHTTPRequestHandler):
             "/first.json": "first.json",
             "/second.json": "second.json",
             "/index.json": "index.json",
+            "/records.json": "records.json",
+            "/package.json": "package.json",
+            "/resources.json": "resources.json",
             "/controls.json": "controls.json",
             "/mutable.bin": "mutable.bin",
             "/cancel.bin": "cancel.bin",
@@ -41,6 +44,10 @@ class Origin(BaseHTTPRequestHandler):
             "/beta.bin": "beta.bin",
             "/gamma.bin": "gamma.bin",
         }.get(self.path)
+        if self.path.startswith("/pool/") and (root / "payload.json").exists():
+            digest = hashlib.sha1((root / "payload.json").read_bytes()).hexdigest()
+            if self.path == f"/pool/{digest[:2]}/{digest}":
+                filename = "payload.json"
         if not filename or not (root / filename).exists():
             self.send_error(404)
             return

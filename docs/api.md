@@ -54,3 +54,39 @@ Metiva calculates a SHA-256 content identifier for each object. It can also chec
 The normalized manifest includes releases and files retained from earlier syncs. Removing a source or narrowing a selection stops future collection from it. Its verified files keep their URLs and existing access controls. A change in verified bytes for the same runtime, release identifier and filename updates that URL. Only an administrator can retrieve the earlier bytes from the file timeline.
 
 To withdraw a runtime, park it. Restore it to resume serving the same URLs with the existing visibility and key scopes. A runtime parked individually stays parked across a park and restore of its parent project.
+
+## Nested documents
+
+Under **Import source**, inspect a document, choose its release collection, then inspect one matching record. Filter by a scalar field such as a channel or ID and set how many matching records to follow. Arrays use upstream order and keyed collections use lexicographic key order. In the sample, choose a reference to mirror as a file or open it as a document and select its children. A JSON file can serve either role.
+
+A nested source stores these choices in `mapping.nested`. For example, the following selection follows the descriptor of each matching release, mirrors the portable package, and follows a second document containing content-addressed resources.
+
+```json
+{
+  "nested": {
+    "path": "/records",
+    "version_path": "/version",
+    "filters": [{"path": "/track", "values": ["stable"]}],
+    "limit": 5,
+    "rules": [{
+      "kind": "document", "path": "", "url_path": "/url",
+      "rules": [
+        {"kind": "file", "path": "/packages/portable"},
+        {"kind": "document", "path": "/inventory", "rules": [{
+          "kind": "file", "path": "/objects/*", "name_path": "@key",
+          "digest_path": "/hash", "algorithm": "sha1", "size_path": "/size",
+          "url_template": "https://downloads.example.org/objects/{prefix}/{digest}"
+        }]}
+      ]
+    }]
+  }
+}
+```
+
+Pointers are relative to the current document or release record. A `*` segment selects members of an array or object. For an object, `@key` gives the member's original key. The template substitutes the verified-format hexadecimal digest and its first two characters. Metiva checks the resolved destination on each fetch, including redirects, and verifies the bytes against the expected digest.
+
+Set `required` to `false` to allow an absent branch in layouts that vary by release. An advertised child that fails to load or verify still holds back its release. A shared child can contribute files to several releases. Nested sources publish the normalized manifest. Its optional `logical_path` field preserves directory-qualified resource names alongside URL-safe mirror filenames. Exact input documents are available in the runtime's publication history.
+
+The nested release collection must fit in one root document. An advertised next page or incomplete page count stops the sync before any child requests. A linked document that advertises additional pages through an HTTP Link header or pagination metadata holds back its release. For paginated release lists, use the release-list picker or a manual pagination mapping.
+
+The nested walker allows eight rule levels, 128 distinct document requests including the root, 8 MiB per document and 32 MiB of document bytes per source per sync. Preview uses the same limits. A filter and a release limit apply before Metiva requests child documents. A budget error leaves the previous working publication available.

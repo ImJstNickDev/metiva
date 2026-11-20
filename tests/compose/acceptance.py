@@ -212,6 +212,129 @@ def transfer_controls():
     assert request(base + "/files/v1/cancel.bin", raw=True) == payload
 
 
+def nested_manifests():
+    def write(name, value):
+        data = json.dumps(value).encode()
+        (ROOT / name).write_bytes(data)
+        return {
+            "url": "/" + name,
+            "size": len(data),
+            "sha1": hashlib.sha1(data).hexdigest(),
+        }
+
+    def artifact(name):
+        data = (ROOT / name).read_bytes()
+        return {
+            "url": "/" + name,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+
+    payload = write("payload.json", {"translation": "Document contents"})
+    objects = {
+        name: {"hash": payload["sha1"], "size": payload["size"]}
+        for name in ["labels/a/entry.json", "labels/b/entry.json"]
+    }
+    resources = write("resources.json", {"objects": objects})
+    descriptor = write(
+        "package.json",
+        {"packages": {"portable": artifact("beta.bin")}, "inventory": resources},
+    )
+    records = [
+        {"version": "candidate-1", "track": "early", **descriptor},
+        {"version": "candidate-2", "track": "early", **descriptor},
+        {"version": "unselected", "track": "stable", "url": "/missing.json"},
+    ]
+    write("records.json", {"records": records})
+    runtime = admin(
+        f"projects/{state['project']}/runtimes",
+        "POST",
+        {"name": "Documents", "slug": "documents", "visibility": "private"},
+    )["id"]
+    rt = f"runtimes/{runtime}"
+    source = {"url": ORIGIN + "/records.json"}
+
+    def inspect(**options):
+        return admin(rt + "/inspect-document", "POST", {**source, **options})
+
+    collection = next(c for c in inspect()["collections"] if c["path"] == "/records")
+    assert collection["count"] == 3 and collection["version_path"] == "/version"
+    filters = [{"path": "/track", "values": ["early"]}]
+    sample = inspect(collection="/records", filters=filters)
+    assert sample["sample"]["id"] == "candidate-1"
+    pointer = next(b for b in sample["branches"] if b["path"] == "")["sample_pointer"]
+    branches = inspect(trail=[pointer])["branches"]
+    edge = next(b for b in branches if b["path"] == "/inventory")
+    leaves = inspect(trail=[pointer, edge["sample_pointer"]])["branches"]
+    assert any(b["kind"] == "digest" and b["path"] == "/objects/*" for b in leaves)
+    rules = [
+        {
+            "kind": "document",
+            "path": "",
+            "rules": [
+                {"kind": "file", "path": "/packages/portable"},
+                {
+                    "kind": "document",
+                    "path": "/inventory",
+                    "rules": [
+                        {
+                            "kind": "file",
+                            "path": "/objects/*",
+                            "name_path": "@key",
+                            "digest_path": "/hash",
+                            "algorithm": "sha1",
+                            "size_path": "/size",
+                            "url_template": ORIGIN + "/pool/{prefix}/{digest}",
+                        }
+                    ],
+                },
+            ],
+        }
+    ]
+    source["mapping"] = {
+        "nested": {
+            "path": "/records",
+            "version_path": "/version",
+            "filters": filters,
+            "limit": 5,
+            "rules": rules,
+        }
+    }
+    preview = admin(rt + "/preview", "POST", source)
+    assert [len(r["artifacts"]) for r in preview["releases"]] == [3, 3], preview
+    admin(rt + "/sources", "POST", source)
+    sync(runtime=runtime)
+    view = admin(rt)
+    assert len(view["originals"]) == 3, view["originals"]
+    key = admin(
+        "keys", "POST", {"name": "Documents", "scope": "runtime", "runtimeId": runtime}
+    )["token"]
+    endpoint = "/p/atlas/r/documents/manifest.json"
+    request(endpoint, status=(401,))
+    manifest = request(endpoint, key=key)
+    files = manifest["releases"][0]["artifacts"]
+    logical = [f for f in files if f.get("logical_path")]
+    assert {f["logical_path"] for f in logical} == set(objects)
+    assert len({f["filename"] for f in logical}) == 2
+    for f in logical:
+        url = f["url"].removeprefix("https://mirror.test")
+        request(url, status=(401,))
+        assert request(url, key=key, raw=True) == (ROOT / "payload.json").read_bytes()
+    # A broken pointer holds back its release while a sibling can publish.
+    records[0]["sha1"] = "0" * 40
+    records[1]["version"] = "candidate-3"
+    write("records.json", {"records": records})
+    sync("failed", runtime=runtime)
+    assert {r["version"] for r in request(endpoint, key=key)["releases"]} == {
+        "candidate-1",
+        "candidate-2",
+        "candidate-3",
+    }
+    view = admin(rt)
+    assert view["history"][0]["verified_releases"] == 1
+    assert view["history"][0]["failed_releases"] == 1
+
+
 def save():
     SESSION.write_text(json.dumps(state))
     os.chmod(SESSION, 0o600)
@@ -513,6 +636,8 @@ elif sys.argv[1] == "mirror":
         view["history"][0]["failed_releases"],
     ) == (1, 1)
     save()
+elif sys.argv[1] == "nested":
+    nested_manifests()
 elif sys.argv[1] == "controls":
     transfer_controls()
 elif sys.argv[1] == "restart":

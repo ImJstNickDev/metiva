@@ -57,7 +57,63 @@ export interface ReleaseCollection {
 export interface Selection extends ReleaseCollection {
   index?: SourceIndex;
 }
-export type SourceMapping = Record<string, string> | { selection: Selection };
+export interface ReleaseFilter {
+  path: string;
+  values: string[];
+}
+interface RuleBase {
+  path: string;
+  required?: boolean;
+  url_path?: string;
+  size_path?: string;
+  digest_path?: string;
+  algorithm?: string;
+}
+export interface FileRule extends RuleBase {
+  kind: "file";
+  name_path?: string;
+  url_template?: string;
+}
+export interface DocumentRule extends RuleBase {
+  kind: "document";
+  rules: NestedRule[];
+}
+export type NestedRule = FileRule | DocumentRule;
+export interface NestedSelection {
+  path: string;
+  version_path?: string;
+  filters?: ReleaseFilter[];
+  limit?: number;
+  rules: NestedRule[];
+}
+export interface DocumentCollection {
+  path: string;
+  version_path?: string;
+  count: number;
+  fields: ReleaseFilter[];
+  samples: { id: string; pointer: string; fields: Record<string, string> }[];
+}
+export interface DocumentBranch {
+  path: string;
+  kind: "url" | "digest";
+  sample_pointer: string;
+  sample: string;
+  url_path?: string;
+  name_path?: string;
+  size_path?: string;
+  digest_path?: string;
+  algorithm?: string;
+}
+export interface DocumentInspection {
+  collections: DocumentCollection[];
+  branches: DocumentBranch[];
+  document_bytes: number;
+  truncated?: boolean;
+}
+export type SourceMapping =
+  | Record<string, string>
+  | { selection: Selection }
+  | { nested: NestedSelection };
 export interface Discovery {
   indexes: SourceIndex[];
   collections: ReleaseCollection[];
@@ -84,6 +140,7 @@ export interface Revision {
 }
 export interface Artifact {
   filename: string;
+  logical_path?: string;
   url: string;
   size?: number;
   sha256?: string;

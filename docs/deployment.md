@@ -1,29 +1,35 @@
 # Operating a mirror
 
+## Standalone production deployment
+
+Download `compose-prod.yaml` from the release assets and follow the [quick start](../README.md#run-a-mirror). Compose creates a project bridge. Only the ingress publishes a host port (`8088:80` by default). The API and worker share the bridge and can connect to upstream sources. Docker assigns its subnet. If the host has exhausted its default address pools, set `METIVA_SUBNET` to a free local CIDR before startup. Bind mounts are relative to the Compose file unless you set an absolute `METIVA_DATA_DIR`.
+
+Local administration at `http://localhost:8088` uses the browser's localhost exception for secure cookies. For remote administration use an HTTPS reverse proxy and set `METIVA_PUBLIC_URL` to the exact origin shown in the browser. A reverse proxy on the same host can connect to a loopback-only binding. A proxy on another host or bridge needs a reachable host address. Set `METIVA_PORT` and `METIVA_BIND_ADDRESS` in `.env` to match your routing.
+
 ## Storage and process ownership
 
 Set `METIVA_DATA_DIR` to a local filesystem on the Docker host. The directory holds the database, its WAL and shared-memory files, the object store, temporary downloads and the initial bootstrap secret. Keep staging and artifacts on one filesystem for atomic promotion. Keep the parent private to the deployment account. Allow the ingress worker to read completed objects and traverse its read-only `artifacts` mount.
 
 The API initializes the schema before the worker starts. A shared migration lock also serializes concurrent command-line starts. Both processes use the same numeric UID and GID and enable foreign keys, full synchronous commits, WAL and a 15-second busy timeout. A filesystem lock admits one worker per data directory. A unique partial index admits one queued or running sync per runtime. Artifact bodies stay outside SQLite. The database contains original source bytes, release records and publication membership.
 
-The backend bridge defaults to `10.243.62.0/28`. Set `METIVA_BACKEND_SUBNET` to a free local subnet if it overlaps another route. The bridge permits outbound source inspection and downloads. Only the ingress joins `prod-frontend`. Configure the external reverse proxy for HTTPS and disable response caching on mirror and API paths. The API uses the configured origin to construct URLs. It does not derive trust or scheme from forwarded headers.
+For the source-build `compose.yaml`, the backend bridge defaults to `10.243.62.0/28`. Set `METIVA_BACKEND_SUBNET` to a free local subnet if it overlaps another route. The bridge permits outbound source inspection and downloads. Only the ingress joins `prod-frontend`. Configure the external reverse proxy for HTTPS and disable response caching on mirror and API paths. The API uses the configured origin to construct URLs. It does not derive trust or scheme from forwarded headers.
 
 ## Back up and restore
 
-Stop the three Metiva services and take a consistent backup of the entire data directory, preserving ownership and permissions. Include `.env` separately. Restart with `docker compose up -d` after the backup completes. Treat the backup as private. It includes administrator credential verifiers, sessions and preserved private content.
+Stop the three Metiva services and take a consistent backup of the entire data directory, preserving ownership and permissions. Include `.env` separately. After a standalone backup, restart with `docker compose -f compose-prod.yaml up -d --wait`. For a source deployment, use `docker compose up -d --wait`. Treat the backup as private. It includes administrator credential verifiers, sessions and preserved private content.
 
-Restore into an empty local data directory at the configured path with the same UID/GID. Start the matching tagged code first and check `docker compose ps`, the active publication and an authenticated download before upgrading.
+Restore into an empty local data directory at the configured path with the same UID/GID. Start the matching tagged code first and check service health with `docker compose -f compose-prod.yaml ps` (or `docker compose ps` for source deployments), the active publication and an authenticated download before upgrading.
 
 ## Upgrade
 
-Back up the deployment, check out the desired release and run `docker compose up -d --build`. The API applies embedded, ordered schema migrations before reporting healthy. To roll back an incompatible migration, restore both the matching backup and the previous release.
+Back up the deployment. For a standalone install, replace the production Compose file with the one from the desired release, run `docker compose -f compose-prod.yaml pull`, then `docker compose -f compose-prod.yaml up -d --wait`. Keep your existing data directory, origin and ownership settings. For source builds, check out the desired release and run `docker compose up -d --build`. The API applies embedded, ordered schema migrations before reporting healthy. To roll back an incompatible migration, restore both the matching backup and the previous release.
 
 ## Administrator recovery
 
-From the deployment host, run:
+From a standalone deployment directory, run
 
 ```sh
-docker compose exec metiva-api metiva recover
+docker compose -f compose-prod.yaml exec metiva-api metiva recover
 ```
 
 Enter the new password twice at the protected prompt. Recovery invalidates existing dashboard sessions. Consumer keys can be rotated independently in **Access Keys**. Rotating creates a replacement with the same scope. Revoke the original after updating your consumers.
@@ -41,12 +47,12 @@ For registry deployment, set these variables in `.env` along with the public ori
 ```dotenv
 METIVA_INGRESS_IMAGE=ghcr.io/imjstnickdev/metiva
 METIVA_SERVICE_IMAGE=ghcr.io/imjstnickdev/metiva-service
-METIVA_IMAGE_TAG=v0.1.1
+METIVA_IMAGE_TAG=v0.1.2
 ```
 
 To pull from Docker Hub, set `METIVA_INGRESS_IMAGE=docker.io/imjstnick/metiva` and `METIVA_SERVICE_IMAGE=docker.io/imjstnick/metiva-service` with the same tag.
 
-Run `docker compose pull` followed by `docker compose up -d --no-build`. The API and worker use different commands from the same service image. The release image workflow targets Linux amd64. Build from the tagged source on other architectures.
+Run `docker compose -f compose-prod.yaml pull` followed by `docker compose -f compose-prod.yaml up -d --wait`. The API and worker use different commands from the same service image. The release image workflow targets Linux amd64. Build from the tagged source on other architectures.
 
 The v0.1.1 migration starts each cumulative library with its active v0.1.0 publication. Earlier copies of a current file appear in its timeline. Open **Sync history → Publication history** for a previous manifest and its original source documents. Files that were already administrator-only remain accessible under **Publication → Past files**.
 
@@ -57,5 +63,5 @@ A published GitHub release builds the ingress and service images on GHCR. To als
 To copy an already published tag after enabling Docker Hub, use the **Versioned images** workflow on the default branch.
 
 ```sh
-gh workflow run images.yml -f tag=v0.1.1
+gh workflow run images.yml -f tag=v0.1.2
 ```

@@ -6,12 +6,14 @@ import {
   bytes,
   type ArchiveFile,
   type Discovery,
+  type DocumentInspection,
   type Manifest,
   type Source,
   type SourceMapping,
 } from "./model";
 import { SourcePicker, type SourceInput } from "./SourcePicker";
-import { Dialog, Field, Form, Tabs, str, useNotice } from "./ui";
+import { DocumentPicker } from "./DocumentPicker";
+import { Dialog, Field, Form, Problem, Tabs, str, useNotice } from "./ui";
 
 const fields = [
   ["releases_path", "Release list", "/releases"],
@@ -44,19 +46,29 @@ export function ImportSource({
       ? mapping.selection
       : undefined;
   const manual = mapping as Record<string, string>;
+  const nested =
+    "nested" in mapping && typeof mapping.nested === "object"
+      ? mapping.nested
+      : undefined;
   const [kind, setKind] = useState<"Remote URL" | "Upload JSON">(
     source?.kind === "upload" ? "Upload JSON" : "Remote URL",
   );
   const [mode, setMode] = useState(
-    source && !saved
-      ? Object.keys(mapping).length
-        ? "manual"
-        : "auto"
-      : "pick",
+    nested || !source
+      ? "documents"
+      : saved
+        ? "pick"
+        : Object.keys(mapping).length
+          ? "manual"
+          : "auto",
   );
   const [discovery, setDiscovery] = useState<{
     input: SourceInput;
     result: Discovery;
+  } | null>(null);
+  const [document, setDocument] = useState<{
+    input: SourceInput;
+    result: DocumentInspection;
   } | null>(null);
   const [review, setReview] = useState<Review | null>(null);
   const notice = useNotice();
@@ -78,7 +90,14 @@ export function ImportSource({
           throw new Error("Select a JSON file.");
         input = { upload: await file.text() };
       }
-      if (mode === "pick") {
+      if (mode === "documents") {
+        const result = await api<DocumentInspection>(
+          `runtimes/${id}/inspect-document`,
+          "POST",
+          input,
+        );
+        setDocument({ input, result });
+      } else if (mode === "pick") {
         const result = await api<Discovery>(
           `runtimes/${id}/discover`,
           "POST",
@@ -98,6 +117,15 @@ export function ImportSource({
     },
   });
   const selectedPreview = useMutation({ mutationFn: preview });
+  const fallback = useMutation({
+    mutationFn: (input: SourceInput) =>
+      api<Discovery>(`runtimes/${id}/discover`, "POST", input),
+    onSuccess: (result, input) => {
+      setMode("pick");
+      setDocument(null);
+      setDiscovery({ input, result });
+    },
+  });
   const save = useAction(
     () =>
       api(
@@ -110,13 +138,18 @@ export function ImportSource({
       onClose();
     },
   );
-  const busy = inspect.isPending || selectedPreview.isPending || save.isPending;
+  const busy =
+    inspect.isPending ||
+    selectedPreview.isPending ||
+    save.isPending ||
+    fallback.isPending;
+  const inspected = document ?? discovery;
   return (
     <Dialog
       title={
         review
           ? "Review source"
-          : discovery
+          : inspected
             ? "Choose files to mirror"
             : source
               ? "Edit source"
@@ -125,16 +158,20 @@ export function ImportSource({
       desc={
         review
           ? "Review the files included by this source before saving."
-          : discovery
-            ? discovery.input.url || "Uploaded JSON manifest"
+          : inspected
+            ? inspected.input.url || "Uploaded JSON manifest"
             : "Import an upstream manifest from a URL or a JSON file."
       }
       onClose={onClose}
       busy={busy}
     >
-      <div hidden={!!discovery || !!review}>
+      <div hidden={!!inspected || !!review}>
         <Form
-          submit={mode === "pick" ? "Inspect manifest" : "Preview manifest"}
+          submit={
+            mode === "pick" || mode === "documents"
+              ? "Inspect manifest"
+              : "Preview manifest"
+          }
           onSubmit={inspect.mutate}
           busy={inspect.isPending}
           error={inspect.error}
@@ -173,6 +210,9 @@ export function ImportSource({
                   inspect.reset();
                 }}
               >
+                <option value="documents">
+                  Explore documents and choose files
+                </option>
                 <option value="pick">
                   Choose release lists, channels and platforms
                 </option>
@@ -202,6 +242,39 @@ export function ImportSource({
           </fieldset>
         </Form>
       </div>
+      {document && (
+        <div hidden={!!review}>
+          <DocumentPicker
+            id={id}
+            input={document.input}
+            inspection={document.result}
+            initial={nested}
+            busy={selectedPreview.isPending}
+            error={selectedPreview.error}
+            onReview={(rule) =>
+              selectedPreview.mutate({
+                ...document.input,
+                mapping: { nested: rule },
+              })
+            }
+          />
+          {!document.result.collections.length && (
+            <button
+              type="button"
+              className="btn"
+              disabled={busy}
+              onClick={() => {
+                const input = document.input;
+                inspect.reset();
+                fallback.mutate(input);
+              }}
+            >
+              Inspect linked release indexes
+            </button>
+          )}
+          <Problem error={fallback.error} />
+        </div>
+      )}
       {discovery && (
         <div hidden={!!review}>
           <SourcePicker
@@ -218,18 +291,22 @@ export function ImportSource({
               })
             }
           />
-          <button
-            type="button"
-            className="text-button back-link"
-            disabled={busy}
-            onClick={() => {
-              setDiscovery(null);
-              selectedPreview.reset();
-            }}
-          >
-            Back to source
-          </button>
         </div>
+      )}
+      {inspected && !review && (
+        <button
+          type="button"
+          className="text-button back-link"
+          disabled={busy}
+          onClick={() => {
+            setDiscovery(null);
+            setDocument(null);
+            fallback.reset();
+            selectedPreview.reset();
+          }}
+        >
+          Back to source
+        </button>
       )}
       {review && (
         <Form
@@ -247,7 +324,7 @@ export function ImportSource({
                 save.reset();
               }}
             >
-              {discovery ? "Change selection" : "Back to source"}
+              {inspected ? "Change selection" : "Back to source"}
             </button>
           }
         >
@@ -270,6 +347,7 @@ export function ManifestView({
   onInspect?: (file: ArchiveFile) => void;
 }) {
   const [shown, setShown] = useState(25);
+  const [fileLimits, setFileLimits] = useState(new Map<string, number>());
   const releases = manifest.releases;
   const published = new Map(
     files?.map((f) => [JSON.stringify([f.release, f.filename]), f]),
@@ -301,7 +379,7 @@ export function ManifestView({
             )}
             <span>{r.artifacts.length} files</span>
           </summary>
-          {r.artifacts.map((a, j) => {
+          {r.artifacts.slice(0, fileLimits.get(r.version) ?? 50).map((a, j) => {
             const file = published.get(JSON.stringify([r.version, a.filename]));
             return (
               <div className="artifact" key={j}>
@@ -318,6 +396,9 @@ export function ManifestView({
                   ) : (
                     <strong>{a.filename}</strong>
                   )}
+                  {a.logical_path && a.logical_path !== a.filename && (
+                    <small className="mono wrap">{a.logical_path}</small>
+                  )}
                   <small className="mono wrap">{a.url}</small>
                   {a.sha256 && (
                     <small className="mono wrap">SHA-256 {a.sha256}</small>
@@ -327,6 +408,22 @@ export function ManifestView({
               </div>
             );
           })}
+          {(fileLimits.get(r.version) ?? 50) < r.artifacts.length && (
+            <button
+              type="button"
+              className="btn small"
+              onClick={() =>
+                setFileLimits((limits) =>
+                  new Map(limits).set(
+                    r.version,
+                    (limits.get(r.version) ?? 50) + 50,
+                  ),
+                )
+              }
+            >
+              Show more files in {r.version}
+            </button>
+          )}
         </details>
       ))}
       {shown < releases.length && (

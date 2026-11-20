@@ -240,6 +240,9 @@ it("saves the root URL and only the reviewed historical channels and platform", 
   fireEvent.change(screen.getByLabelText("Manifest URL"), {
     target: { value: url },
   });
+  fireEvent.change(screen.getByLabelText("File selection"), {
+    target: { value: "pick" },
+  });
   fireEvent.click(screen.getByRole("button", { name: "Inspect manifest" }));
   fireEvent.change(await screen.findByLabelText("Release inventory"), {
     target: { value: "index-0" },
@@ -378,6 +381,257 @@ it("edits a saved direct-list rule and sends its selected channel and artifact k
     ),
   );
 });
+const sample = {
+  id: "2.0",
+  pointer: "/versions/14",
+  fields: { "/type": "stable" },
+};
+const nestedRoot = {
+  path: "/versions",
+  version_path: "/id",
+  count: 925,
+  fields: [{ path: "/type", values: ["preview", "stable"] }],
+  samples: [sample],
+};
+const link = (path: string, pointer: string) => ({
+  kind: "url",
+  path,
+  url_path: "/url",
+  sample: "https://releases.example.org/document",
+  sample_pointer: pointer,
+});
+const templatesRoot = link("", "/versions/14/url");
+const server = link("/downloads/server", "/downloads/server/url");
+const library = link(
+  "/libraries/*/downloads/artifact",
+  "/libraries/0/downloads/artifact/url",
+);
+const assets = link("/assetIndex", "/assetIndex/url");
+const hashBranch = {
+  path: "/objects/*",
+  kind: "digest",
+  digest_path: "/hash",
+  algorithm: "sha1",
+  size_path: "/size",
+  name_path: "@key",
+  sample: "a".repeat(40),
+  sample_pointer: "/objects/logo/hash",
+};
+const urlTemplate = "https://files.example.org/{prefix}/{digest}";
+function nestedApi() {
+  const calls: { path: string; method: string; body: any }[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((path: string, opts: RequestInit) => {
+      const body = JSON.parse(String(opts.body));
+      calls.push({ path, method: opts.method || "", body });
+      if (path.endsWith("/inspect-document")) {
+        const base = { document_bytes: 120, collections: [], branches: [] };
+        if (body.trail?.length === 2)
+          return ok({ ...base, branches: [hashBranch] });
+        if (body.trail?.length === 1)
+          return ok({ ...base, branches: [server, library, assets] });
+        if (body.collection)
+          return ok({ ...base, sample, branches: [templatesRoot] });
+        return ok({ ...base, collections: [nestedRoot] });
+      }
+      if (path.endsWith("/preview")) return ok(reviewed);
+      return ok({ id: 20 });
+    }),
+  );
+  return calls;
+}
+it("follows a filtered release sample, selects file and optional library branches, and saves a digest mapping in a second child", async () => {
+  const calls = nestedApi();
+  mount(<ImportSource id={9} onClose={() => {}} />);
+  fireEvent.change(screen.getByLabelText("Manifest URL"), {
+    target: { value: url },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Inspect manifest" }));
+  const limit = (await screen.findByLabelText(
+    "Release limit",
+  )) as HTMLInputElement;
+  expect(limit.value).toBe("5");
+  fireEvent.change(limit, { target: { value: "2" } });
+  fireEvent.change(screen.getByLabelText("Add release filter"), {
+    target: { value: "/type" },
+  });
+  fireEvent.click(screen.getByLabelText("stable"));
+  fireEvent.click(
+    screen.getByRole("button", { name: "Inspect sample release" }),
+  );
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Follow JSON link" }),
+  );
+  await screen.findByRole("option", { name: /downloads\/server/ });
+  const choose = (label: string) => {
+    const field = screen.getByLabelText("Document field");
+    const value = within(field).getByRole("option", {
+      name: label,
+    }) as HTMLOptionElement;
+    fireEvent.change(field, { target: { value: value.value } });
+  };
+  choose("/downloads/server · /url");
+  fireEvent.click(screen.getByRole("button", { name: "Use as file" }));
+  choose("/libraries/*/downloads/artifact · /url");
+  fireEvent.click(screen.getByRole("button", { name: "Use as file" }));
+  fireEvent.click(screen.getByRole("button", { name: "Follow JSON link" }));
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Map digest to file" }),
+  );
+  expect(
+    (
+      screen.getByRole("button", {
+        name: "Preview selected files",
+      }) as HTMLButtonElement
+    ).disabled,
+  ).toBe(true);
+  fireEvent.change(screen.getByLabelText("File URL template"), {
+    target: { value: urlTemplate },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Back to parent document" }),
+  );
+  expect(
+    screen.getByRole("button", { name: "Remove /downloads/server" }),
+  ).toBeTruthy();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Preview selected files" }),
+  );
+  await screen.findByRole("heading", { name: "Review source" });
+  const mapping = {
+    nested: {
+      path: "/versions",
+      version_path: "/id",
+      limit: 2,
+      filters: [{ path: "/type", values: ["stable"] }],
+      rules: [
+        {
+          kind: "document",
+          path: "",
+          url_path: "/url",
+          rules: [
+            { kind: "file", path: server.path, url_path: "/url" },
+            {
+              kind: "file",
+              path: library.path,
+              url_path: "/url",
+              required: false,
+            },
+            {
+              kind: "document",
+              path: assets.path,
+              url_path: "/url",
+              rules: [
+                {
+                  kind: "file",
+                  path: hashBranch.path,
+                  digest_path: "/hash",
+                  algorithm: "sha1",
+                  size_path: "/size",
+                  name_path: "@key",
+                  required: false,
+                  url_template: urlTemplate,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  };
+  expect(
+    calls
+      .filter((c) => c.path.endsWith("/inspect-document"))
+      .map((c) => c.body),
+  ).toEqual([
+    { url },
+    {
+      url,
+      collection: "/versions",
+      filters: [{ path: "/type", values: ["stable"] }],
+    },
+    { url, trail: ["/versions/14/url"] },
+    { url, trail: ["/versions/14/url", "/assetIndex/url"] },
+  ]);
+  expect(calls.at(-1)?.body).toEqual({ url, mapping });
+  fireEvent.click(screen.getByRole("button", { name: "Import source" }));
+  await waitFor(() =>
+    expect(calls.at(-1)).toEqual({
+      path: "/api/admin/runtimes/9/sources",
+      method: "POST",
+      body: { url, mapping },
+    }),
+  );
+});
+it("reopens saved nested selections and preserves their rules while changing the release limit", async () => {
+  const calls = nestedApi();
+  const nested = {
+    path: "/versions",
+    version_path: "/id",
+    limit: 5,
+    filters: [{ path: "/type", values: ["stable"] }],
+    rules: [
+      {
+        kind: "document",
+        path: "",
+        url_path: "/url",
+        rules: [
+          {
+            kind: "file",
+            path: server.path,
+            url_path: "/url",
+            required: false,
+          },
+        ],
+      },
+    ],
+  };
+  mount(
+    <ImportSource
+      id={9}
+      source={{
+        id: 20,
+        kind: "url",
+        url,
+        mapping: JSON.stringify({ nested }),
+        status: "ok",
+        last_checked: null,
+        last_success: null,
+      }}
+      onClose={() => {}}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Inspect manifest" }));
+  expect(await screen.findByText(server.path)).toBeTruthy();
+  expect((screen.getByLabelText("stable") as HTMLInputElement).checked).toBe(
+    true,
+  );
+  fireEvent.change(screen.getByLabelText("Release limit"), {
+    target: { value: "8" },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Preview selected files" }),
+  );
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Change selection" }),
+  );
+  expect(
+    (screen.getByLabelText("Release limit") as HTMLInputElement).value,
+  ).toBe("8");
+  fireEvent.click(
+    screen.getByRole("button", { name: "Preview selected files" }),
+  );
+  fireEvent.click(await screen.findByRole("button", { name: "Save source" }));
+  await waitFor(() =>
+    expect(calls.at(-1)).toEqual({
+      path: "/api/admin/sources/20",
+      method: "PATCH",
+      body: { url, mapping: { nested: { ...nested, limit: 8 } } },
+    }),
+  );
+});
+
 const runtimeData = {
   id: 9,
   slug: "linux",
