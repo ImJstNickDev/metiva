@@ -72,7 +72,7 @@ def main():
         assert all(v["type"] == "bind" for s in services.values() for v in s["volumes"])
         assert services["metiva"]["volumes"][0]["read_only"]
         if "--pull" in sys.argv:
-            assert all(s["image"].endswith(":v0.1.3") for s in services.values())
+            assert all(s["image"].endswith(":v0.1.4") for s in services.values())
 
         # Bind a random loopback port, leaving every production port and network untouched.
         env.update(
