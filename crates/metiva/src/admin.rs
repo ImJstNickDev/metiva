@@ -324,7 +324,13 @@ async fn runtime(State(s): State<AppState>, Path(id): Path<i64>) -> ResultJson {
             .fetch_one(&s.db)
             .await?
     );
-    item["history"]=records(sqlx::query("SELECT id,state,created_at,finished_at,error,verified_releases,failed_releases FROM jobs WHERE runtime_id=? ORDER BY id DESC LIMIT 100").bind(id).fetch_all(&s.db).await?);
+    item["history"] = records(sqlx::query(
+        "SELECT j.id,j.state,j.created_at,j.finished_at,j.error,j.verified_releases,j.failed_releases,
+         CASE WHEN j.state='running' AND NOT EXISTS(SELECT 1 FROM job_plans WHERE job_id=j.id)
+         THEN (SELECT count(*) FROM sources s JOIN source_observations o ON o.source_id=s.id
+               AND o.job_id=j.id WHERE s.runtime_id=j.runtime_id) END AS documents_read
+         FROM jobs j WHERE j.runtime_id=? ORDER BY j.id DESC LIMIT 100"
+    ).bind(id).fetch_all(&s.db).await?);
     Ok(Json(item))
 }
 async fn check_source(s: &AppState, id: i64, c: &SourceInput) -> Result<Value, ApiError> {
@@ -361,7 +367,10 @@ async fn require_idle(
 ) -> Result<(), ApiError> {
     parking::require_available(tx, runtime).await?;
     let busy: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM jobs WHERE runtime_id=? AND state='running')",
+        "SELECT EXISTS(SELECT 1 FROM jobs j WHERE j.runtime_id=? AND (
+            j.state='running' OR (j.state='queued' AND EXISTS(
+                SELECT 1 FROM sources s JOIN source_observations o ON o.source_id=s.id
+                AND o.job_id=j.id WHERE s.runtime_id=j.runtime_id))))",
     )
     .bind(runtime)
     .fetch_one(&mut **tx)
@@ -369,7 +378,7 @@ async fn require_idle(
     if busy {
         return Err(ApiError(
             StatusCode::CONFLICT,
-            "Wait for the running sync to finish before editing sources".into(),
+            "Wait for the active sync to finish before editing sources".into(),
         ));
     }
     Ok(())
@@ -706,4 +715,40 @@ async fn original(
         ],
         body,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_job_keeps_its_captured_sources_during_recovery() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = crate::open(dir.path(), "https://mirror.example").await?;
+        let mut tx = state.db.begin().await?;
+        sqlx::raw_sql(
+            "INSERT INTO projects(name,slug) VALUES('P','p');
+             INSERT INTO runtimes(project_id,name,slug) VALUES(1,'R','r');
+             INSERT INTO sources(runtime_id,kind,upload) VALUES(1,'upload',X'7B7D');
+             INSERT INTO jobs(runtime_id,state) VALUES(1,'queued');",
+        )
+        .execute(&mut *tx)
+        .await?;
+        assert!(require_idle(&mut tx, 1).await.is_ok());
+        sqlx::raw_sql(
+            "INSERT INTO raw_documents(digest,body) VALUES('root',X'7B7D');
+             INSERT INTO source_observations(source_id,job_id,page,digest) VALUES(1,1,0,'root');",
+        )
+        .execute(&mut *tx)
+        .await?;
+        assert_eq!(
+            require_idle(&mut tx, 1).await.unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        sqlx::query("UPDATE jobs SET state='completed' WHERE id=1")
+            .execute(&mut *tx)
+            .await?;
+        assert!(require_idle(&mut tx, 1).await.is_ok());
+        Ok(())
+    }
 }

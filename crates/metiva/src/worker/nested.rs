@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     sync::{Arc, OnceLock},
 };
@@ -15,6 +15,7 @@ use url::Url;
 const MAX_RULES: usize = 128;
 const MAX_DEPTH: usize = 8;
 const MAX_STEPS: usize = 2_000_000;
+const PREVIEW_RELEASES: usize = 5;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -295,6 +296,9 @@ pub(super) struct Document {
     base: Option<Url>,
     observation: Option<i64>,
     pub(super) link: Option<String>,
+    /// Storage can retain an earlier observation for an effective URL even
+    /// after the walker has evicted that document.
+    pub(super) cache_effective: bool,
     hashes: DigestCache,
     parsed: OnceLock<Result<Value, String>>,
     complete: OnceLock<Result<(), String>>,
@@ -306,6 +310,7 @@ impl Document {
             base,
             observation,
             link: None,
+            cache_effective: true,
             hashes: DigestCache::default(),
             parsed: OnceLock::new(),
             complete: OnceLock::new(),
@@ -336,6 +341,8 @@ impl Document {
 /// Inner errors describe an observed upstream failure. Outer errors indicate
 /// that storage or replay failed, so no release may publish from this graph.
 pub(super) trait Documents {
+    /// A repeated request must resolve to the same observation, including failures
+    /// and redirects, even after its document has left the walker's cache.
     async fn load(&mut self, url: Option<&Url>) -> Result<Result<Document, String>>;
 }
 
@@ -357,7 +364,10 @@ fn bound(condition: bool, error: &'static str) -> Result<()> {
 
 struct Graph<'a, D> {
     docs: &'a mut D,
-    cache: HashMap<Option<Url>, Result<Arc<Document>, String>>,
+    preview: bool,
+    cache: HashMap<Url, Result<Arc<Document>, String>>,
+    cached_bytes: usize,
+    release_urls: HashSet<Url>,
     requests: usize,
     bytes: usize,
     steps: usize,
@@ -365,37 +375,89 @@ struct Graph<'a, D> {
     leaf_count: usize,
     inventory: BTreeMap<i64, Catalog>,
 }
-impl<D: Documents> Graph<'_, D> {
-    async fn load(&mut self, url: Option<&Url>) -> Result<Arc<Document>> {
-        if let Some(cached) = self.cache.get(&url.cloned()) {
-            return cached.clone().map_err(|e| anyhow!("{e}"));
+impl<'a, D: Documents> Graph<'a, D> {
+    fn new(docs: &'a mut D, preview: bool) -> Self {
+        Self {
+            docs,
+            preview,
+            cache: HashMap::new(),
+            cached_bytes: 0,
+            release_urls: HashSet::new(),
+            requests: 0,
+            bytes: 0,
+            steps: 0,
+            descriptor_bytes: 0,
+            leaf_count: 0,
+            inventory: BTreeMap::new(),
         }
-        self.requests += 1;
-        bound(
-            self.requests <= super::feed::MAX_PAGES,
-            "nested manifest exceeds document limit",
-        )?;
-        let mut result = self.docs.load(url).await.context(GraphError)?.map(Arc::new);
-        if let Ok(doc) = &result {
-            self.bytes += doc.bytes.len();
-            bound(
-                self.bytes <= super::feed::SOURCE_BYTES,
-                "nested manifest exceeds byte limit",
-            )?;
-            if let Some(base) = &doc.base {
-                match self.cache.get(&Some(base.clone())) {
-                    Some(Ok(prior)) if prior.bytes != doc.bytes => {
-                        result = Err("document changed between redirect aliases".into());
+    }
+
+    fn begin_release(&mut self, root_bytes: usize) {
+        // Keep small shared indexes hot. A new release can add its entire
+        // document budget without retaining the history of earlier releases.
+        if self.cache.len() > super::feed::MAX_PAGES / 4
+            || self.cached_bytes > super::feed::SOURCE_BYTES / 4
+        {
+            self.cache.clear();
+            self.cached_bytes = 0;
+        }
+        self.release_urls.clear();
+        self.requests = 1;
+        self.bytes = root_bytes;
+        self.steps = 0;
+    }
+
+    fn document_budget(&self, within_limit: bool, resource: &str) -> Result<()> {
+        if within_limit {
+            return Ok(());
+        }
+        if self.preview {
+            return Err(anyhow!("nested preview exceeds {resource} limit").context(GraphError));
+        }
+        bail!("nested release exceeds {resource} limit")
+    }
+
+    async fn load(&mut self, url: &Url) -> Result<Arc<Document>> {
+        let first = self.release_urls.insert(url.clone());
+        if first {
+            self.requests += 1;
+            self.document_budget(self.requests <= super::feed::MAX_PAGES, "document")?;
+        }
+        let result = if let Some(cached) = self.cache.get(url) {
+            cached.clone()
+        } else {
+            let mut result = self
+                .docs
+                .load(Some(url))
+                .await
+                .context(GraphError)?
+                .map(Arc::new);
+            if let Ok(doc) = &result {
+                self.cached_bytes += doc.bytes.len();
+                if let Some(base) = doc.base.as_ref().filter(|_| doc.cache_effective) {
+                    match self.cache.get(base) {
+                        Some(Ok(prior)) if prior.bytes != doc.bytes => {
+                            result = Err("document changed between redirect aliases".into());
+                        }
+                        None => {
+                            self.cache.insert(base.clone(), result.clone());
+                        }
+                        _ => (),
                     }
-                    None => {
-                        self.cache.insert(Some(base.clone()), result.clone());
-                    }
-                    _ => (),
                 }
             }
+            self.cache.insert(url.clone(), result.clone());
+            result
+        };
+        let doc = result.map_err(|e| anyhow!("{e}"))?;
+        if first {
+            if doc.cache_effective {
+                self.release_urls.extend(doc.base.clone());
+            }
+            self.bytes += doc.bytes.len();
+            self.document_budget(self.bytes <= super::feed::SOURCE_BYTES, "byte")?;
         }
-        self.cache.insert(url.cloned(), result.clone());
-        result.map_err(|e| anyhow!("{e}"))
+        Ok(doc)
     }
 
     async fn rules(
@@ -420,7 +482,7 @@ impl<D: Documents> Graph<'_, D> {
                             "document reference cycle at {}",
                             rule.path
                         );
-                        let child = self.load(Some(&url)).await?;
+                        let child = self.load(&url).await?;
                         ensure!(
                             !child
                                 .base
@@ -659,24 +721,29 @@ fn selected(filter: &Filter, row: &Value, key: Option<&str>) -> bool {
         false
     })
 }
+#[derive(Default)]
+pub(super) struct SelectionCounts {
+    pub(super) selected: usize,
+    pub(super) previewed: usize,
+}
+
 pub(super) async fn execute(
     rules: &Nested,
     url: Option<&Url>,
     docs: &mut impl Documents,
-    strict: bool,
-) -> Result<(Catalog, BTreeMap<i64, Catalog>)> {
+    preview: bool,
+) -> Result<(Catalog, BTreeMap<i64, Catalog>, SelectionCounts)> {
     rules.validate()?;
-    let mut graph = Graph {
-        docs,
-        cache: HashMap::new(),
-        requests: 0,
-        bytes: 0,
-        steps: 0,
-        descriptor_bytes: 0,
-        leaf_count: 0,
-        inventory: BTreeMap::new(),
-    };
-    let root = graph.load(url).await?;
+    let root = docs
+        .load(url)
+        .await
+        .context(GraphError)?
+        .map_err(|e| anyhow!("{e}"))?;
+    bound(
+        root.bytes.len() <= super::feed::SOURCE_BYTES,
+        "nested root exceeds byte limit",
+    )?;
+    let mut graph = Graph::new(docs, preview);
     let list = root
         .json()?
         .pointer(&rules.path)
@@ -696,17 +763,30 @@ pub(super) async fn execute(
     )?;
     let mut catalog = Catalog::new();
     let ancestors: Vec<_> = url.cloned().into_iter().chain(root.base.clone()).collect();
-    let mut count = 0;
+    let mut counts = SelectionCounts::default();
+    let filter_cost = 1 + rules.filters.iter().map(|f| f.values.len()).sum::<usize>();
+    let mut filter_steps = 0;
     for (row, key) in rows {
-        charge(
-            &mut graph.steps,
-            1 + rules.filters.iter().map(|f| f.values.len()).sum::<usize>(),
-        )?;
+        if rules.limit == Some(counts.selected) {
+            break;
+        }
+        charge(&mut filter_steps, filter_cost)?;
         if !rules.filters.iter().all(|f| selected(f, row, key)) {
             continue;
         }
-        count += 1;
-        ensure!(count <= adapter::MAX_ITEMS, "too many releases");
+        counts.selected += 1;
+        ensure!(counts.selected <= adapter::MAX_ITEMS, "too many releases");
+        if preview {
+            if counts.previewed == PREVIEW_RELEASES {
+                continue;
+            }
+            counts.previewed += 1;
+        }
+        // Preview has no persisted observations. Keep all sampled documents
+        // in one bounded graph so every repeated edge sees the same bytes.
+        if !preview || counts.previewed == 1 {
+            graph.begin_release(root.bytes.len());
+        }
         let version = match rules.version_path.as_deref() {
             None | Some("@key") => adapter::segment(
                 key.context("release identifier needs a map key or version pointer")?,
@@ -751,21 +831,14 @@ pub(super) async fn execute(
                 catalog.reject(version, format!("{error:#}"));
             }
         }
-        if rules.limit == Some(count) {
-            break;
-        }
     }
     catalog.check_limits()?;
-    ensure!(
-        !strict || !catalog.assets.is_empty() || !catalog.release_errors.is_empty(),
-        "nested selection matched no files"
-    );
     for inventory in graph.inventory.values_mut() {
         inventory
             .assets
             .retain(|(release, _), _| !catalog.release_errors.contains_key(release));
     }
-    Ok((catalog, graph.inventory))
+    Ok((catalog, graph.inventory, counts))
 }
 
 #[cfg(test)]

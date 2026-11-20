@@ -408,6 +408,12 @@ pub(crate) async fn limited_get(
                 _permits: None,
             }
         };
+        ensure!(
+            response.status != StatusCode::NOT_MODIFIED
+                || headers.contains_key(reqwest::header::IF_NONE_MATCH)
+                || headers.contains_key(reqwest::header::IF_MODIFIED_SINCE),
+            "unsolicited 304 without a conditional request"
+        );
         response._permits = permits;
         if matches!(response.status.as_u16(), 429 | 503)
             && let Some(delay) = response
