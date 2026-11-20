@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM rust:1.98-bookworm AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target cargo build --locked --release -p metiva && cp target/release/metiva /usr/local/bin/metiva
 
