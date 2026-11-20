@@ -340,6 +340,88 @@ def save():
     os.chmod(SESSION, 0o600)
 
 
+def full_history_before_restart():
+    releases = []
+    for i in range(925):
+        number = f"{i:04}"
+        payload = ("build-" + number).encode()
+        (ROOT / f"history-{number}.bin").write_bytes(payload)
+        document = {
+            "file": {
+                "url": f"{number}.bin",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+            "metadata": "x" * 39000,
+        }
+        (ROOT / f"history-{number}.json").write_text(json.dumps(document))
+        releases.append({"id": number, "url": f"/history/{number}.json"})
+    (ROOT / "history.json").write_text(json.dumps({"releases": releases}))
+    (ROOT / "history-delay").touch()
+    runtime = admin(
+        f"projects/{state['project']}/runtimes",
+        "POST",
+        {"name": "Full history", "slug": "history", "visibility": "private"},
+    )["id"]
+    rt = f"runtimes/{runtime}"
+    source = {
+        "url": ORIGIN + "/history.json",
+        "mapping": {
+            "nested": {
+                "path": "/releases",
+                "version_path": "/id",
+                "rules": [
+                    {
+                        "path": "",
+                        "kind": "document",
+                        "rules": [{"path": "/file", "kind": "file"}],
+                    }
+                ],
+            }
+        },
+    }
+    preview = admin(rt + "/preview", "POST", source)
+    assert preview["selection"] == {"matched": 925, "previewed": 5}
+    assert [r["version"] for r in preview["releases"]] == [f"{i:04}" for i in range(5)]
+    assert len((ROOT / "history-reads").read_text().splitlines()) == 5
+    admin(rt + "/sources", "POST", source)
+    job = admin(rt + "/sync", "POST", {})["id"]
+    state["history_runtime"] = runtime
+    state["history_job"] = job
+    save()
+    wait(
+        lambda: "0340" in (ROOT / "history-reads").read_text().splitlines(),
+        "Worker never reached the middle of the catalogue",
+    )
+    record = next(j for j in admin(rt)["history"] if j["id"] == job)
+    assert record["documents_read"] >= 340, record
+
+
+def full_history_after_restart():
+    runtime = state["history_runtime"]
+    record = wait_job(runtime, state["history_job"], {"completed"}, timeout=240)
+    assert record["verified_releases"] == 925 and record["failed_releases"] == 0, record
+    # Each of these descriptors was recorded before interruption, outside both previews.
+    reads = (ROOT / "history-reads").read_text().splitlines()
+    assert all(reads.count(f"{i:04}") == 1 for i in range(5, 340))
+    key = admin(
+        "keys", "POST", {"name": "History", "scope": "runtime", "runtimeId": runtime}
+    )["token"]
+    base = "/p/atlas/r/history"
+    releases = request(base + "/manifest.json", key=key)["releases"]
+    assert len(releases) == 925
+    for i, release in enumerate(releases):
+        number = f"{i:04}"
+        [artifact] = release["artifacts"]
+        payload = ("build-" + number).encode()
+        assert release["version"] == number
+        assert artifact["sha256"] == hashlib.sha256(payload).hexdigest()
+        if i in (0, 127, 128, 340, 924):
+            assert (
+                request(f"{base}/files/{number}/{number}.bin", key=key, raw=True)
+                == payload
+            )
+
+
 base = "/p/atlas/r/linux"
 published = base + "/manifest.json"
 alpha = base + "/files/winter-01/alpha.bin"
@@ -638,6 +720,13 @@ elif sys.argv[1] == "mirror":
     save()
 elif sys.argv[1] == "nested":
     nested_manifests()
+elif sys.argv[1] == "history-start":
+    full_history_before_restart()
+elif sys.argv[1] == "history-change":
+    (ROOT / "history.json").write_text('{"releases":[]}')
+    (ROOT / "history-delay").unlink()
+elif sys.argv[1] == "history-finish":
+    full_history_after_restart()
 elif sys.argv[1] == "controls":
     transfer_controls()
 elif sys.argv[1] == "restart":

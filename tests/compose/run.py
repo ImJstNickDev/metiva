@@ -158,6 +158,11 @@ ssl_certificate_key /tls/key; location / {proxy_pass http://metiva:80; proxy_buf
             client("mirror")
             client("nested")
             client("controls")
+            client("history-start")
+            compose("kill", "-s", "SIGKILL", "metiva-worker")
+            client("history-change")
+            compose("up", "-d", "--wait", "metiva-worker")
+            client("history-finish")
             compose("restart", "metiva-api", "metiva-worker", "metiva", "tls-proxy")
             client("restart")
         except BaseException:
