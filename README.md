@@ -12,26 +12,23 @@ Metiva mirrors artifacts from JSON release feeds. Inspect a feed, start a sync, 
 
 ## Run a mirror
 
-Use a Linux host with Docker Compose, local disk storage and an existing external Docker network named `prod-frontend`. Run these commands from the checkout as the account that will own the data.
+Download the production Compose file into a new directory on a Linux amd64 host. It runs three versioned images and publishes the dashboard and mirror on port **8088**. Run the commands as the account that owns the data.
 
 ```sh
-git clone https://github.com/ImJstNickDev/metiva.git
-cd metiva
-cp .env.example .env
+mkdir metiva && cd metiva
+curl --fail --location --output compose-prod.yaml \
+  https://github.com/ImJstNickDev/metiva/releases/download/v0.1.2/compose-prod.yaml
 install -d -m 700 data
 install -d -m 755 data/artifacts
-```
-
-Set `METIVA_PUBLIC_URL` in `.env` to your external HTTPS origin. Set `METIVA_UID` and `METIVA_GID` to the numbers printed by `id -u` and `id -g`. When using a different data directory, create its `artifacts` subdirectory before starting.
-
-```sh
-docker compose config --quiet
-docker compose up -d --build
-docker compose ps
+printf 'METIVA_UID=%s\nMETIVA_GID=%s\n' "$(id -u)" "$(id -g)" > .env
+docker compose -f compose-prod.yaml pull
+docker compose -f compose-prod.yaml up -d --wait
 cat data/bootstrap-secret
 ```
 
-In Nginx Proxy Manager, create a proxy host for the configured domain. Select **HTTP**, forward to **metiva** on port **80**, and enable HTTPS on the public host. Open the dashboard over HTTPS. Enter the local bootstrap secret and choose the administrator username and password. Setup consumes the secret.
+Open `http://localhost:8088` on the host, enter the bootstrap secret and choose an administrator password. For remote access, set `METIVA_PUBLIC_URL` to the public HTTPS origin in `.env`, forward your reverse proxy to the host's HTTP port 8088, and recreate the services. Set `METIVA_PORT` to use another port or `METIVA_BIND_ADDRESS=127.0.0.1` to bind only to loopback.
+
+For source builds and deployments on an existing external proxy network, use the repository's `compose.yaml`. [Deployment and upgrades](docs/deployment.md)
 
 ## Publish a runtime
 

@@ -1,0 +1,57 @@
+x-service: &service
+  image: ${METIVA_SERVICE_IMAGE:-ghcr.io/imjstnickdev/metiva-service}:${METIVA_IMAGE_TAG:-v0.1.2}
+  user: "${METIVA_UID:-1000}:${METIVA_GID:-1000}"
+  environment:
+    METIVA_PUBLIC_URL: ${METIVA_PUBLIC_URL:-http://localhost:${METIVA_PORT:-8088}}
+    METIVA_DATA: /data
+    METIVA_CONNECT_TIMEOUT_SECS: ${METIVA_CONNECT_TIMEOUT_SECS:-15}
+    METIVA_IDLE_TIMEOUT_SECS: ${METIVA_IDLE_TIMEOUT_SECS:-45}
+    METIVA_MAX_ARTIFACT_BYTES: ${METIVA_MAX_ARTIFACT_BYTES:-34359738368}
+  volumes:
+    - ${METIVA_DATA_DIR:-./data}:/data
+  restart: unless-stopped
+  stop_grace_period: 30s
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  metiva-api:
+    <<: *service
+    command: ["api"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 4s
+      retries: 5
+      start_period: 10s
+
+  metiva-worker:
+    <<: *service
+    command: ["worker"]
+    depends_on:
+      metiva-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "metiva", "worker-health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  metiva:
+    image: ${METIVA_INGRESS_IMAGE:-ghcr.io/imjstnickdev/metiva}:${METIVA_IMAGE_TAG:-v0.1.2}
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "${METIVA_BIND_ADDRESS:-0.0.0.0}:${METIVA_PORT:-8088}:80"
+    volumes:
+      - ${METIVA_DATA_DIR:-./data}/artifacts:/srv/objects:ro
+    depends_on:
+      metiva-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 15s
+      retries: 3
+      timeout: 4s
