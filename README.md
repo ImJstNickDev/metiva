@@ -6,7 +6,7 @@
 </p>
 <p align="center"><strong>Manifests in. Mirrors out.</strong></p>
 
-Metiva mirrors artifacts from JSON release feeds. Inspect a feed, start a sync, and give consumers a stable manifest on your own domain. Each runtime keeps serving its last successful publication while replacements download and verify.
+Metiva mirrors artifacts from JSON release feeds. Inspect a feed, start a sync, and give consumers a stable manifest on your own domain. Each runtime keeps a cumulative library. When an upstream drops a version, its verified files stay available at their existing mirror URLs.
 
 ![Metiva dashboard showing active transfers and real publication history](assets/dashboard.png)
 
@@ -36,10 +36,11 @@ In Nginx Proxy Manager, create a proxy host for the configured domain. Select **
 ## Publish a runtime
 
 1. In **Projects**, create a project and a runtime. Choose visibility explicitly when you want anonymous downloads.
-2. Import a remote manifest URL or upload its JSON. Inspect the detected releases and filenames. Use a mapping for nested or differently named fields.
+2. Import a manifest URL or upload JSON. Choose a release list or linked index, select the channels and artifact groups to follow, then preview the exact files and known download size. Edit that selection later to include new platforms or channels.
 3. Add the source and start synchronization. **Transfers** shows observed bytes, verification and retries.
 4. Copy the published endpoint from the runtime. Consumers can fetch the manifest at `/p/{project}/r/{runtime}/manifest.json`. A compatible single feed can also provide `upstream.json`.
-5. Open **Archive** for prior publications, their original inputs and preserved artifacts. Removed files require an administrator session once they leave the active publication.
+5. Select a filename in **Publication** for its revision timeline. A verified correction takes over its existing URL. An administrator can download earlier bytes from the timeline.
+6. Park a runtime or project to take its endpoints offline. Restore it from **Archive** to serve its preserved publication again.
 
 For a private runtime, create a read key in **Access Keys**. Select the narrowest scope your consumer needs. The dashboard shows the secret once. Supply it in an HTTP header.
 
@@ -63,6 +64,8 @@ python3 tests/compose/run.py
 ```
 
 The Compose test creates a temporary data directory, test origin and TLS proxy. It exercises publication, interrupted transfer recovery, archive access and credential rotation end to end. It requires Docker with Compose v2.24+ and OpenSSL.
+
+Versioned Linux amd64 ingress and service images are published to GHCR and Docker Hub. [Deploy prebuilt images](docs/deployment.md#versioned-images)
 
 The [contributor guide](CONTRIBUTING.md) covers local API, worker and dashboard development.
 

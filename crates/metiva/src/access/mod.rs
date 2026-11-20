@@ -9,7 +9,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 mod auth;
-mod consumer;
+pub(crate) mod consumer;
 mod keys;
 pub use auth::{initialize, recover, require_admin, valid_session};
 pub use consumer::openapi;
@@ -60,7 +60,7 @@ pub(crate) async fn json_rejections(
     response
 }
 
-struct Error(StatusCode, &'static str);
+pub(crate) struct Error(StatusCode, &'static str);
 type Result<T> = std::result::Result<T, Error>;
 
 impl From<sqlx::Error> for Error {

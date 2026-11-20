@@ -69,7 +69,7 @@ impl Reader {
             return Ok(Self(None));
         };
         let hash = digest(raw);
-        let grant: Grant = sqlx::query_as("SELECT scope,project_id,runtime_id,last_used_at FROM api_keys WHERE digest=? AND revoked_at IS NULL")
+        let grant: Grant = sqlx::query_as("SELECT scope,CASE WHEN scope != 'runtime' OR runtime_id IN (SELECT id FROM available_runtimes) THEN project_id END project_id,runtime_id,last_used_at FROM api_keys WHERE digest=? AND revoked_at IS NULL")
             .bind(&hash).fetch_optional(&state.db).await?.ok_or(Error(StatusCode::UNAUTHORIZED, "Invalid bearer credential"))?;
         if grant
             .last_used_at
@@ -128,7 +128,7 @@ struct Project {
 async fn projects(State(state): State<AppState>, h: HeaderMap) -> Result<Json<Vec<Project>>> {
     let reader = Reader::from_request(&state, &h).await?;
     let mut list: Vec<Project> =
-        sqlx::query_as("SELECT id,name,slug,description,visibility FROM projects ORDER BY slug")
+        sqlx::query_as("SELECT id,name,slug,description,visibility FROM projects WHERE parked_at IS NULL ORDER BY slug")
             .fetch_all(&state.db)
             .await?;
     list.retain(|p| reader.allows(p.id, None, p.visibility == "public"));
@@ -153,7 +153,7 @@ struct Runtime {
 macro_rules! runtime_query {
     ($filter:literal) => { concat!(
         "SELECT r.id,r.project_id,(p.visibility='public' AND r.visibility IN ('inherit','public')) public,
-        r.active_publication,r.name,r.slug,r.last_success FROM runtimes r JOIN projects p ON p.id=r.project_id WHERE ", $filter
+        r.active_publication,r.name,r.slug,r.last_success FROM available_runtimes r JOIN projects p ON p.id=r.project_id WHERE ", $filter
     ) };
 }
 
@@ -164,7 +164,7 @@ async fn runtimes(
 ) -> Result<Json<Vec<Runtime>>> {
     let reader = Reader::from_request(&state, &h).await?;
     let (id, visibility): (i64, String) =
-        sqlx::query_as("SELECT id,visibility FROM projects WHERE slug=?")
+        sqlx::query_as("SELECT id,visibility FROM projects WHERE parked_at IS NULL AND slug=?")
             .bind(project)
             .fetch_optional(&state.db)
             .await?
@@ -276,7 +276,7 @@ async fn availability(
     ))
 }
 
-fn attachment(digest: String, filename: String) -> Result<Response> {
+pub(crate) fn attachment(digest: String, filename: String) -> Result<Response> {
     if digest.len() != 64
         || !digest
             .bytes()

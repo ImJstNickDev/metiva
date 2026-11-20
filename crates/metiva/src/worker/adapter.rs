@@ -8,9 +8,9 @@ use url::Url;
 
 const MAX_ITEMS: usize = 100_000;
 const RELEASES: &[&str] = &["releases", "versions", "items", "data"];
-const VERSION: &[&str] = &["version", "tag_name", "release", "name", "id"];
+pub(super) const VERSION: &[&str] = &["version", "tag_name", "release", "name", "id"];
 const ASSETS: &[&str] = &["artifacts", "assets", "files", "downloads", "platforms"];
-const URLS: &[&str] = &[
+pub(super) const URLS: &[&str] = &[
     "browser_download_url",
     "download_url",
     "url",
@@ -31,7 +31,32 @@ pub(crate) struct Mapping {
     size_path: Option<String>,
     sha256_path: Option<String>,
     pub next_path: Option<String>,
+    pub selection: Option<super::selection::Selection>,
 }
+impl Mapping {
+    pub(super) fn validate(&self) -> Result<()> {
+        if let Some(rule) = &self.selection {
+            ensure!(
+                [
+                    &self.releases_path,
+                    &self.version_path,
+                    &self.artifacts_path,
+                    &self.url_path,
+                    &self.filename_path,
+                    &self.size_path,
+                    &self.sha256_path,
+                    &self.next_path
+                ]
+                .into_iter()
+                .all(Option::is_none),
+                "choose a guided selection or a manual mapping"
+            );
+            rule.validate()?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct Artifact {
     pub url: Url,
@@ -42,16 +67,38 @@ pub(crate) struct Artifact {
 }
 #[derive(Default, Clone, PartialEq, Eq)]
 pub(crate) struct Catalog {
+    pub release_errors: BTreeMap<String, String>,
     pub assets: BTreeMap<(String, String), Artifact>,
     pub versions: BTreeMap<String, Map<String, Value>>,
 }
 impl Catalog {
+    fn check_limits(&self) -> Result<()> {
+        ensure!(
+            self.versions.len() + self.release_errors.len() <= MAX_ITEMS
+                && self.assets.len() <= MAX_ITEMS,
+            "manifest exceeds item limits"
+        );
+        Ok(())
+    }
+    pub(super) fn reject(&mut self, version: String, error: String) {
+        self.versions.remove(&version);
+        let files: Vec<_> = self
+            .assets
+            .range((version.clone(), String::new())..)
+            .take_while(|((release, _), _)| release == &version)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for file in files {
+            self.assets.remove(&file);
+        }
+        self.release_errors.entry(version).or_insert(error);
+    }
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-fn escaped(key: &str) -> String {
+pub(super) fn escaped(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
 }
 fn pointer(path: &str) -> String {
@@ -81,7 +128,7 @@ fn select<'a>(
     let selected = v.pointer(&ptr)?;
     Some((ptr, selected))
 }
-fn segment(v: &str) -> Result<String> {
+pub(super) fn segment(v: &str) -> Result<String> {
     ensure!(
         v.len() <= 255
             && !v.is_empty()
@@ -91,7 +138,7 @@ fn segment(v: &str) -> Result<String> {
     );
     Ok(v.to_owned())
 }
-fn parse_url(v: &str, base: Option<&Url>) -> Result<Url> {
+pub(super) fn parse_url(v: &str, base: Option<&Url>) -> Result<Url> {
     let mut url = match base {
         Some(b) => b.join(v)?,
         None => Url::parse(v).context("uploaded feeds require absolute artifact URLs")?,
@@ -150,13 +197,27 @@ fn insert(out: &mut Catalog, id: (String, String), item: Artifact) -> Result<()>
     Ok(())
 }
 pub(crate) fn merge(out: &mut Catalog, page: Catalog) -> Result<()> {
+    for (version, error) in page.release_errors {
+        out.reject(version, error);
+    }
     for (v, m) in page.versions {
-        add_version(out, &v, &m)?;
+        if !out.release_errors.contains_key(&v)
+            && let Err(error) = add_version(out, &v, &m)
+        {
+            out.check_limits()?;
+            out.reject(v, format!("{error:#}"));
+        }
     }
     for (k, v) in page.assets {
-        insert(out, k, v)?;
+        let version = k.0.clone();
+        if !out.release_errors.contains_key(&version)
+            && let Err(error) = insert(out, k, v)
+        {
+            out.check_limits()?;
+            out.reject(version, format!("{error:#}"));
+        }
     }
-    Ok(())
+    out.check_limits()
 }
 
 fn add_hash(hashes: &mut BTreeMap<String, String>, algorithm: &str, digest: &str) -> Result<()> {
@@ -350,6 +411,22 @@ impl Scan<'_> {
             None => segment(key.context("release version is missing")?)?,
             _ => bail!("invalid release version"),
         };
+        if !self.doc.catalog.release_errors.contains_key(&version)
+            && let Err(error) = self.release_files(release, path, version_field, &version)
+        {
+            self.doc.catalog.check_limits()?;
+            self.doc.catalog.reject(version, format!("{error:#}"));
+        }
+        Ok(())
+    }
+    fn release_files(
+        &mut self,
+        release: &Value,
+        path: &str,
+        version_field: Option<(String, &Value)>,
+        version: &str,
+    ) -> Result<()> {
+        let m = self.mapping;
         let assets = select(release, &m.artifacts_path, ASSETS);
         let mut meta = Map::new();
         if assets.is_some() {
@@ -370,23 +447,55 @@ impl Scan<'_> {
                 }
             }
         }
-        add_version(&mut self.doc.catalog, &version, &meta)?;
+        add_version(&mut self.doc.catalog, version, &meta)?;
         if let Some((ptr, items)) = assets {
             if items.as_object().is_some_and(|o| o.is_empty()) {
                 return Ok(());
             }
-            self.artifact(items, &version, &format!("{path}{ptr}"), &[])?;
+            self.artifact(items, version, &format!("{path}{ptr}"), &[])?;
         } else {
             ensure!(
                 m.artifacts_path.is_none()
                     && (select(release, &m.url_path, URLS).is_some() || release.is_array()),
                 "missing artifacts for release {version}"
             );
-            self.artifact(release, &version, path, &[])?;
+            self.artifact(release, version, path, &[])?;
         }
         Ok(())
     }
 }
+pub(super) fn selected_release<'a>(
+    version: &str,
+    metadata: &Map<String, Value>,
+    artifacts: impl Iterator<Item = (Option<&'a str>, &'a Value)>,
+    base: Option<&Url>,
+) -> Result<Catalog> {
+    let mapping = Mapping::default();
+    let mut scan = Scan {
+        mapping: &mapping,
+        base,
+        doc: Document {
+            catalog: Catalog::new(),
+            positions: Vec::new(),
+            next: None,
+        },
+    };
+    add_version(&mut scan.doc.catalog, version, metadata)?;
+    for (key, item) in artifacts {
+        // A guided variant is a leaf. If upstream changes it into a whole
+        // group, recursively normalizing that group would widen the saved scope.
+        let descriptor = |v: &Value| v.is_string() || URLS.iter().any(|k| v.get(*k).is_some());
+        ensure!(
+            descriptor(item)
+                || key.is_none() && item.as_array().is_some_and(|a| a.iter().all(descriptor)),
+            "selected variant no longer contains artifact descriptors"
+        );
+        let platform: Vec<_> = key.into_iter().map(str::to_owned).collect();
+        scan.artifact(item, version, "", &platform)?;
+    }
+    Ok(scan.doc.catalog)
+}
+
 fn scan(root: &Value, m: &Mapping, base: Option<&Url>) -> Result<Document> {
     let next = select(root, &m.next_path, &["next", "next_url"])
         .filter(|(_, v)| !v.is_null())
@@ -428,6 +537,7 @@ fn scan(root: &Value, m: &Mapping, base: Option<&Url>) -> Result<Document> {
         }
         _ => bail!("expected a release collection"),
     }
+    scan.doc.catalog.check_limits()?;
     Ok(scan.doc)
 }
 /// Adapters normalize one document at a time. The worker owns transport, page limits,
@@ -457,7 +567,10 @@ impl ManifestAdapter for GenericJson {
         base: Option<&Url>,
         out: &mut Catalog,
     ) -> Result<Option<Url>> {
-        parse(bytes, m, base, out)
+        let root: Value = serde_json::from_slice(bytes).context("invalid JSON document")?;
+        let doc = scan(&root, m, base)?;
+        merge(out, doc.catalog)?;
+        Ok(doc.next)
     }
     fn compatible_manifest(
         &self,
@@ -469,16 +582,11 @@ impl ManifestAdapter for GenericJson {
         rewrite(bytes, m, base, mirrored)
     }
 }
-pub(crate) fn parse(
-    bytes: &[u8],
-    m: &Mapping,
-    base: Option<&Url>,
-    out: &mut Catalog,
-) -> Result<Option<Url>> {
-    let root: Value = serde_json::from_slice(bytes).context("invalid JSON document")?;
-    let doc = scan(&root, m, base)?;
-    merge(out, doc.catalog)?;
-    Ok(doc.next)
+#[cfg(test)]
+fn parse(bytes: &[u8], m: &Mapping, base: Option<&Url>, out: &mut Catalog) -> Result<Option<Url>> {
+    let next = GenericJson.parse_page(bytes, m, base, out)?;
+    ensure!(out.release_errors.is_empty(), "release validation failed");
+    Ok(next)
 }
 
 pub(crate) fn releases(catalog: &Catalog) -> Value {
@@ -537,10 +645,13 @@ pub(crate) fn rewrite(
     mirrored: &Catalog,
 ) -> Option<Value> {
     let mut root: Value = serde_json::from_slice(bytes).ok()?;
-    if signature(&root) {
+    if m.selection.is_some() || signature(&root) {
         return None;
     }
     let doc = scan(&root, m, base).ok()?;
+    if !doc.catalog.release_errors.is_empty() {
+        return None;
+    }
     for (pointer, id) in doc.positions {
         *root.pointer_mut(&pointer)? = Value::String(mirrored.assets.get(&id)?.url.to_string());
     }

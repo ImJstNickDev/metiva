@@ -364,33 +364,86 @@ async fn storage_counts_physical_objects_and_settings_validate_limits() {
             .await["sync_interval"],
         300
     );
-    d.call(Method::GET, "archive?before=5", None, 200).await;
+    d.call(Method::GET, "archive", None, 200).await;
 }
 
 #[tokio::test]
-async fn archive_cursor_reaches_oldest_publication_and_excludes_current() {
+async fn parking_cancels_work_and_restores_only_explicit_targets() {
     let d = Dashboard::new().await;
     let runtime = d.create_runtime().await;
-    sqlx::query(
-        "WITH RECURSIVE seq(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM seq WHERE id<104)
-        INSERT INTO publications(id,runtime_id,manifest) SELECT id,?,'{}' FROM seq",
-    )
-    .bind(runtime)
-    .execute(&d.state.db)
-    .await
-    .unwrap();
-    sqlx::query("UPDATE runtimes SET active_publication=104 WHERE id=?")
-        .bind(runtime)
-        .execute(&d.state.db)
-        .await
+    let rt = format!("runtimes/{runtime}");
+    let project = d.call(Method::GET, &rt, None, 200).await["project_id"]
+        .as_i64()
         .unwrap();
-    let first = d.call(Method::GET, "archive", None, 200).await;
-    assert_eq!(first.as_array().unwrap().len(), 100);
-    assert_eq!(first[0]["id"], 103);
-    let cursor = first[99]["id"].as_i64().unwrap();
-    let next = d
-        .call(Method::GET, &format!("archive?before={cursor}"), None, 200)
+    let p = format!("projects/{project}");
+    d.call(
+        Method::POST,
+        &format!("{rt}/sources"),
+        Some(upload("v1")),
+        200,
+    )
+    .await;
+    let job = d.call(Method::POST, &format!("{rt}/sync"), None, 200).await["id"]
+        .as_i64()
+        .unwrap();
+    let transfer = sqlx::query("INSERT INTO transfers(job_id,runtime_id,filename,host,backend,state,command) VALUES(?,?,'bundle.bin','example.org','native','downloading','pause')")
+        .bind(job).bind(runtime).execute(&d.state.db).await.unwrap().last_insert_rowid();
+    d.call(Method::POST, &format!("{rt}/park"), None, 200).await;
+    d.call(Method::POST, &format!("{rt}/sync"), None, 409).await;
+    let view = d.call(Method::GET, &rt, None, 200).await;
+    assert_eq!(view["history"][0]["state"], "cancelled");
+    assert_eq!(
+        d.call(Method::GET, "transfers", None, 200).await[0]["state"],
+        "cancelled"
+    );
+    d.call(
+        Method::POST,
+        &format!("transfers/{transfer}/retry"),
+        None,
+        409,
+    )
+    .await;
+    assert!(view["parked_at"].is_number());
+    assert_eq!(
+        d.call(Method::GET, "overview", None, 200).await["runtimes"],
+        0
+    );
+    d.call(Method::POST, &format!("{p}/park"), None, 200).await;
+    assert_eq!(d.call(Method::GET, "projects", None, 200).await, json!([]));
+    let archive = d.call(Method::GET, "archive", None, 200).await;
+    assert_eq!(archive.as_array().unwrap().len(), 2);
+    assert!(
+        archive
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["kind"] == "runtime" && v["parent_parked"] == true)
+    );
+    d.call(Method::POST, &format!("{rt}/restore"), None, 409)
         .await;
-    assert_eq!(next.as_array().unwrap().len(), 3);
-    assert_eq!(next[2]["id"], 1);
+    d.call(Method::POST, &format!("{p}/restore"), None, 200)
+        .await;
+    assert_eq!(
+        d.call(Method::GET, &format!("{p}/runtimes"), None, 200)
+            .await,
+        json!([])
+    );
+    d.call(Method::POST, &format!("{rt}/restore"), None, 200)
+        .await;
+    assert_eq!(d.call(Method::GET, "archive", None, 200).await, json!([]));
+    d.call(
+        Method::POST,
+        &format!("transfers/{transfer}/retry"),
+        None,
+        200,
+    )
+    .await;
+    d.call(Method::POST, &format!("{p}/park"), None, 200).await;
+    assert!(d.call(Method::GET, &rt, None, 200).await["project_parked_at"].is_number());
+    d.call(Method::POST, &format!("{p}/restore"), None, 200)
+        .await;
+    assert_eq!(
+        d.call(Method::GET, "overview", None, 200).await["runtimes"],
+        1
+    );
 }

@@ -24,6 +24,7 @@ import {
   useNotice,
 } from "./ui";
 import { RuntimeView } from "./Runtime";
+import { ParkingAction } from "./Archive";
 
 export function ProjectDialog({
   onClose,
@@ -204,17 +205,39 @@ function ProjectDetail({ project }: { project: Project }) {
         desc={project.description || `/p/${project.slug}`}
         actions={
           <>
-            <button className="btn" onClick={() => setModal("visibility")}>
-              <Settings2 />
-              Visibility
-            </button>
-            <button className="btn primary" onClick={() => setModal("runtime")}>
-              <Plus />
-              New runtime
-            </button>
+            <ParkingAction
+              kind="project"
+              id={project.id}
+              name={project.name}
+              restore={!!project.parked_at}
+            />
+            {!project.parked_at && (
+              <button className="btn" onClick={() => setModal("visibility")}>
+                <Settings2 />
+                Visibility
+              </button>
+            )}
+            {!project.parked_at && (
+              <button
+                className="btn primary"
+                onClick={() => setModal("runtime")}
+              >
+                <Plus />
+                New runtime
+              </button>
+            )}
           </>
         }
       />
+      {project.parked_at && (
+        <div className="runtime-strip">
+          <Status value="parked" />
+          <span>Parked {date(project.parked_at)}</span>
+          <a className="more" href="#archive">
+            View archive
+          </a>
+        </div>
+      )}
       <Panel title="Runtimes" icon={Layers3}>
         <Data query={runtimes}>
           {(rs) =>
@@ -248,7 +271,9 @@ function ProjectDetail({ project }: { project: Project }) {
                         </td>
                         <td className="capitalize">{r.visibility}</td>
                         <td>
-                          <Status value={r.status} />
+                          <Status
+                            value={project.parked_at ? "parked" : r.status}
+                          />
                         </td>
                         <td>{date(r.last_success, "Never")}</td>
                       </tr>
@@ -278,32 +303,24 @@ function ProjectDetail({ project }: { project: Project }) {
 export function Projects({ route }: { route: string[] }) {
   const projects = useResource<Project[]>("projects", {
     refetchInterval: 15000,
+    enabled: !route[1],
   });
   const [newProject, setNewProject] = useState(false),
     [search, setSearch] = useState("");
+  const project = useResource<Project>("projects/" + route[1], {
+    enabled: !!route[1],
+    refetchInterval: 15000,
+  });
   if (route[1])
     return (
-      <Data query={projects}>
-        {(ps) => {
-          const p = ps.find((p) => p.id === Number(route[1]));
-          if (!p)
-            return (
-              <Empty
-                icon={Folder}
-                title="Project unavailable"
-                action={
-                  <a href="#projects" className="btn">
-                    Back to projects
-                  </a>
-                }
-              />
-            );
-          return route[2] === "runtimes" && route[3] ? (
+      <Data query={project}>
+        {(p) =>
+          route[2] === "runtimes" && route[3] ? (
             <RuntimeView key={route[3]} id={Number(route[3])} project={p} />
           ) : (
             <ProjectDetail key={p.id} project={p} />
-          );
-        }}
+          )
+        }
       </Data>
     );
   return (

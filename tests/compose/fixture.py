@@ -32,6 +32,7 @@ class Origin(BaseHTTPRequestHandler):
             "/source.json": "source.json",
             "/first.json": "first.json",
             "/second.json": "second.json",
+            "/index.json": "index.json",
             "/controls.json": "controls.json",
             "/mutable.bin": "mutable.bin",
             "/cancel.bin": "cancel.bin",

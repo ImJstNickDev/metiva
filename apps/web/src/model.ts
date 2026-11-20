@@ -8,6 +8,7 @@ export type Visibility = "public" | "private" | "inherit";
 export type Id = number;
 export type Time = number | null;
 export interface Project {
+  parked_at?: Time;
   id: Id;
   name: string;
   slug: string;
@@ -18,6 +19,8 @@ export interface Project {
   status: string;
 }
 export interface Runtime {
+  parked_at?: Time;
+  project_parked_at?: Time;
   id: Id;
   name: string;
   slug: string;
@@ -36,7 +39,48 @@ export interface Source {
   last_modified?: string;
   last_checked: Time;
   last_success: Time;
-  mapping?: Record<string, string> | string | null;
+  mapping?: SourceMapping | string | null;
+}
+export interface ArtifactGroup {
+  path: string;
+  keys: string[];
+}
+export interface SourceIndex extends ArtifactGroup {
+  link_path: string;
+}
+export interface ReleaseCollection {
+  channels?: ArtifactGroup;
+  path: string;
+  version_path: string;
+  groups: ArtifactGroup[];
+}
+export interface Selection extends ReleaseCollection {
+  index?: SourceIndex;
+}
+export type SourceMapping = Record<string, string> | { selection: Selection };
+export interface Discovery {
+  indexes: SourceIndex[];
+  collections: ReleaseCollection[];
+}
+export interface ParkedResource {
+  kind: "project" | "runtime";
+  id: Id;
+  name: string;
+  slug: string;
+  project_id: Id;
+  project_name: string;
+  parked_at: number;
+  parent_parked: boolean;
+}
+export interface Revision {
+  id: Id;
+  created_at: number;
+  digest: string;
+  size: number;
+  source_url: string;
+  job_id: Id | null;
+  current: boolean;
+  download_url: string;
 }
 export interface Artifact {
   filename: string;
@@ -45,9 +89,11 @@ export interface Artifact {
   sha256?: string;
 }
 export interface Manifest {
-  releases: { version: string; artifacts: Artifact[] }[];
+  releases: { version: string; channel?: string; artifacts: Artifact[] }[];
 }
 export interface Activity {
+  verified_releases?: number | null;
+  failed_releases?: number | null;
   id: Id;
   project?: string;
   runtime?: string;
