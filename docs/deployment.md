@@ -30,7 +30,7 @@ Enter the new password twice at the protected prompt. Recovery invalidates exist
 
 ## Inspect a failed sync
 
-Use the runtime's sync history and source status to identify the failed request or artifact. Inspect the transfer for size, checksum and retry information. A failed preparation leaves the previous publication active. Disk usage grows as new artifacts arrive. Reserve space for active downloads, retained content and backups.
+Use the runtime's sync history and source status to identify the failed request or artifact. Inspect the transfer for size, checksum and retry information. A failed source fetch keeps the previous publication active. If a complete input contains a bad release, the history reports verified and failed release counts. Previously served files remain available. Disk usage grows as new artifacts arrive. Reserve space for active downloads, retained content and backups.
 
 Set `METIVA_CONNECT_TIMEOUT_SECS` for the connection budget, `METIVA_IDLE_TIMEOUT_SECS` for idle reads and `METIVA_MAX_ARTIFACT_BYTES` for the maximum transfer size. Defaults are 15 seconds, 45 seconds and 32 GiB. Set these values in the deployment's `.env` and recreate the API and worker. Configure engine, concurrency, retries and scheduling in **Settings**.
 
@@ -41,7 +41,19 @@ For registry deployment, set these variables in `.env` along with the public ori
 ```dotenv
 METIVA_INGRESS_IMAGE=ghcr.io/imjstnickdev/metiva
 METIVA_SERVICE_IMAGE=ghcr.io/imjstnickdev/metiva-service
-METIVA_IMAGE_TAG=v0.1.0
+METIVA_IMAGE_TAG=v0.1.1
 ```
 
 Run `docker compose pull` followed by `docker compose up -d --no-build`. The API and worker use different commands from the same service image. The release image workflow targets Linux amd64. Build from the tagged source on other architectures.
+
+The v0.1.1 migration starts each cumulative library with its active v0.1.0 publication. Earlier copies of a current file appear in its timeline. Open **Sync history → Publication history** for a previous manifest and its original source documents. Files that were already administrator-only remain accessible under **Publication → Past files**.
+
+### Publishing images as a maintainer
+
+A published GitHub release builds the ingress and service images on GHCR. To also publish on Docker Hub, configure the repository Actions variable `DOCKERHUB_USERNAME` and the Actions secret `DOCKERHUB_TOKEN` with write access to both public repositories, `metiva` and `metiva-service`. For an organization, set `DOCKERHUB_NAMESPACE` to its Docker Hub name. The workflow copies the released manifests and checks their digests against GHCR.
+
+To copy an already published tag after enabling Docker Hub, use the **Versioned images** workflow on the default branch.
+
+```sh
+gh workflow run images.yml -f tag=v0.1.1
+```

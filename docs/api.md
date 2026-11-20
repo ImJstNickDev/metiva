@@ -15,6 +15,8 @@ Fetch `GET /api/v1/openapi.json` from the running service for the machine-readab
 
 Public projects can contain private runtimes. A private project restricts every runtime within it. List endpoints filter by effective visibility and credential scope. A private resource requires a valid bearer key. Missing, invalid and revoked credentials return 401. A valid key outside its scope receives 403.
 
+Parking a project takes every child runtime offline. Parking one runtime leaves its siblings available. Consumer discovery, manifests, release metadata and byte-range requests all respect parking, including requests with a global key.
+
 A global key includes future projects. A project key includes future runtimes within that project. A runtime key covers just the selected runtime. Each key remains valid until revoked. Store the key as a secret in the consuming service.
 
 ## A source feed
@@ -41,6 +43,14 @@ For a different source layout, specify `releases_path`, `version_path`, `artifac
 
 The Generic JSON adapter accepts up to 128 pages per source, with an 8 MiB page limit and a 32 MiB aggregate limit. The dashboard accepts uploads within its 5 MiB request-body limit. Pagination can follow a next-page field or HTTP Link header. The worker validates each new destination and redirect against the outbound network policy.
 
-Sources merge in a stable order. Conflicting entries at the same release and filename stop the publication. The administrator can inspect original source bytes separately from the normalized and rewritten manifests.
+In the import dialog, choose **Choose release lists, channels and platforms** to inspect the document. A linked index lets you follow explicit channel keys to paginated release lists. A direct list reads releases from the current document. Select the file groups to mirror and preview their filenames before saving. Metiva persists the paths and selected keys. Future entries within those keys are collected automatically. Extend the selection explicitly for new keys. Manual mapping remains available for layouts outside discovery.
 
-Metiva calculates a SHA-256 content identifier for each object. It can also check upstream MD5, SHA-1, SHA-256, SHA-384 and SHA-512 metadata. For ZIP, gzip and tar-family formats that the worker recognizes, it reads and checks the archive stream without extracting members. Single unsigned documents can have an upstream-shaped publication. Multi-source, paginated and signed inputs publish the normalized format and retain their original bytes.
+Sources merge in a stable order. Conflicting entries for the same release and filename hold that release back. Once Metiva can identify the releases in a complete input, independently verified releases can publish while another release needs attention. An unreadable source or incomplete page chain keeps the previous publication in place. The administrator can inspect original source bytes separately from the normalized and rewritten manifests.
+
+Metiva calculates a SHA-256 content identifier for each object. It can also check upstream MD5, SHA-1, SHA-256, SHA-384 and SHA-512 metadata. For ZIP, gzip and tar-family formats that the worker recognizes, it reads and checks the archive stream without extracting members. A single unsigned document can have an upstream-shaped publication when it represents the complete published inventory. Multi-source, selected, paginated and signed inputs publish the normalized format and retain their original bytes.
+
+## Retention and corrections
+
+The normalized manifest includes releases and files retained from earlier syncs. Removing a source or narrowing a selection stops future collection from it. Its verified files keep their URLs and existing access controls. A change in verified bytes for the same runtime, release identifier and filename updates that URL. Only an administrator can retrieve the earlier bytes from the file timeline.
+
+To withdraw a runtime, park it. Restore it to resume serving the same URLs with the existing visibility and key scopes. A runtime parked individually stays parked across a park and restore of its parent project.
