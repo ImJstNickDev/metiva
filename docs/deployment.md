@@ -44,6 +44,8 @@ METIVA_SERVICE_IMAGE=ghcr.io/imjstnickdev/metiva-service
 METIVA_IMAGE_TAG=v0.1.1
 ```
 
+To pull from Docker Hub, set `METIVA_INGRESS_IMAGE=docker.io/imjstnick/metiva` and `METIVA_SERVICE_IMAGE=docker.io/imjstnick/metiva-service` with the same tag.
+
 Run `docker compose pull` followed by `docker compose up -d --no-build`. The API and worker use different commands from the same service image. The release image workflow targets Linux amd64. Build from the tagged source on other architectures.
 
 The v0.1.1 migration starts each cumulative library with its active v0.1.0 publication. Earlier copies of a current file appear in its timeline. Open **Sync history → Publication history** for a previous manifest and its original source documents. Files that were already administrator-only remain accessible under **Publication → Past files**.

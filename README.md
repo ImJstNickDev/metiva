@@ -65,7 +65,7 @@ python3 tests/compose/run.py
 
 The Compose test creates a temporary data directory, test origin and TLS proxy. It exercises publication, interrupted transfer recovery, archive access and credential rotation end to end. It requires Docker with Compose v2.24+ and OpenSSL.
 
-Versioned Linux amd64 ingress and service images are available on GHCR. [Deploy prebuilt images](docs/deployment.md#versioned-images)
+Versioned Linux amd64 ingress and service images are published to GHCR and Docker Hub. [Deploy prebuilt images](docs/deployment.md#versioned-images)
 
 The [contributor guide](CONTRIBUTING.md) covers local API, worker and dashboard development.
 
