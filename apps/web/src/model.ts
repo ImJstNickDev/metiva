@@ -289,6 +289,9 @@ export function percent(t: Pick<Transfer, "bytes" | "total" | "state">) {
   if (t.total === 0) return t.state === "completed" ? 100 : null;
   return Math.max(0, Math.min(100, (100 * t.bytes) / t.total));
 }
+export function transferStatusHref(status: string) {
+  return status ? "#transfers/" + encodeURIComponent(status) : "#transfers";
+}
 export function actions(state: string) {
   switch (state) {
     case "retrying":
