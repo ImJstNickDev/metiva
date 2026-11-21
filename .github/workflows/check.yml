@@ -46,5 +46,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test release gates and registry promotion
+        run: python3 -B -m unittest discover -s tests/release -v
       - run: python3 tests/compose/run.py
       - run: python3 tests/compose/standalone.py
