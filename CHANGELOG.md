@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.5
+
+- Keep the last dashboard view visible through an outage. Metiva pauses actions, checks the session and refreshes data when the server returns. A previously loaded dashboard can reopen its reconnecting screen during downtime. Private API responses stay out of the offline cache.
+- Open Active or Queued transfers directly from Overview. The selected filter follows live changes in transfer state.
+- Return to the top of long lists with a keyboard-accessible scroll control that respects reduced-motion preferences.
+- Read long URLs in publication history without scrolling sideways. The JSON keeps its original indentation when copied.
+- Start standalone Compose with automatic subnet allocation or an explicit `METIVA_SUBNET`. For upgrades using an explicit subnet, follow the [network migration instructions](https://github.com/ImJstNickDev/metiva/blob/v0.1.5/docs/deployment.md#upgrade).
+- Pin the release images using `image-digests.txt` from the release assets. The same ingress and service images are available on GHCR and Docker Hub.
+
 ## v0.1.4
 
 - Let long-running syncs finish writing inventory while the scheduler checks for work. This prevents large syncs from stalling on SQLite writer contention.

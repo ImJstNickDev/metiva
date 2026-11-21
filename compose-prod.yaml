@@ -1,5 +1,5 @@
 x-service: &service
-  image: ${METIVA_SERVICE_REF:-${METIVA_SERVICE_IMAGE:-ghcr.io/imjstnickdev/metiva-service}:${METIVA_IMAGE_TAG:-v0.1.4}}
+  image: ${METIVA_SERVICE_REF:-${METIVA_SERVICE_IMAGE:-ghcr.io/imjstnickdev/metiva-service}:${METIVA_IMAGE_TAG:-v0.1.5}}
   networks: &mirror-networks
     - default${METIVA_SUBNET:+-static}
   user: "${METIVA_UID:-1000}:${METIVA_GID:-1000}"
@@ -41,7 +41,7 @@ services:
       start_period: 15s
 
   metiva:
-    image: ${METIVA_INGRESS_REF:-${METIVA_INGRESS_IMAGE:-ghcr.io/imjstnickdev/metiva}:${METIVA_IMAGE_TAG:-v0.1.4}}
+    image: ${METIVA_INGRESS_REF:-${METIVA_INGRESS_IMAGE:-ghcr.io/imjstnickdev/metiva}:${METIVA_IMAGE_TAG:-v0.1.5}}
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
