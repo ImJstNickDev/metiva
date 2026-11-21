@@ -232,16 +232,19 @@ def publish(repo, sha, tag, directory, draft, has_tag):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_subparsers(dest="mode", required=True)
-    modes.add_parser("check").add_argument("tag")
+    for mode in ("check", "rehearse"):
+        modes.add_parser(mode).add_argument("tag")
     final = modes.add_parser("publish")
     final.add_argument("tag")
     final.add_argument("directory", type=Path)
     args = parser.parse_args()
     repo, sha = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_SHA"]
     verify_checkout(repo, sha, args.tag)
+    verify_ci(repo, sha)
+    if args.mode == "rehearse":
+        return
     draft = existing_draft(repo, sha, args.tag)
     has_tag = check_tag(repo, sha, args.tag, draft, preflight=args.mode == "check")
-    verify_ci(repo, sha)
     if args.mode == "publish":
         publish(repo, sha, args.tag, args.directory, draft, has_tag)
 

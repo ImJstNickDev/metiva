@@ -30,6 +30,19 @@ def completed_run(**overrides):
 
 
 class VerifyTests(unittest.TestCase):
+    def test_rehearsal_requires_verified_code_and_performs_no_release_operations(self):
+        with (
+            patch.dict(os.environ, {"GITHUB_REPOSITORY": REPO, "GITHUB_SHA": SHA}),
+            patch.object(sys, "argv", ["release_github.py", "rehearse", TAG]),
+            patch.object(release, "verify_checkout") as checkout,
+            patch.object(release, "api", return_value={"workflow_runs": [completed_run()]}) as api,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            release.main()
+        checkout.assert_called_once_with(REPO, SHA, TAG)
+        self.assertEqual(api.call_count, 1)
+        self.assertIn("actions/workflows/check.yml/runs?", api.call_args.args[1])
+
     def test_waits_for_the_exact_successful_push(self):
         responses = [
             {"workflow_runs": []},

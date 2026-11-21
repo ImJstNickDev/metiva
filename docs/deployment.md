@@ -63,9 +63,11 @@ Starting with the next release after v0.1.4, `image-digests.txt` in the release 
 ### Publishing a release
 
 1. Merge the intended changes into `main` through pull requests. Prepare the package versions, production Compose defaults and the matching `## vX.Y.Z` section in `CHANGELOG.md` in a release preparation PR. That section supplies the public release notes.
-2. On GitHub, run **Actions → Release → Run workflow** on `main`, with the new version as the tag. The CLI equivalent is `gh workflow run images.yml --ref main -f tag=vX.Y.Z` with the prepared version. GitHub fixes the commit at dispatch time.
+2. On GitHub, run **Actions → Release → Run workflow** on `main`, with the new version as the tag. Select the publication checkbox. The CLI equivalent is `gh workflow run images.yml --ref main -f tag=vX.Y.Z -F publish=true` with the prepared version. GitHub fixes the commit at dispatch time.
 3. The workflow waits for the successful `Verify` run on that exact push to `main`. It builds the two Linux amd64 candidates on GHCR, records their digests and starts and recreates all three services using those digests and the release's standalone Compose file.
 4. It copies the tested digests to the version tags on GHCR and Docker Hub, checks all four references, and prepares the offline Docker archive, Compose file, image pins and SHA-256 checksums. The final job checks GitHub's stored asset digests, creates the annotated Git tag and publishes the draft. Versions in the 0.x series are marked as development pre-releases.
+
+To exercise the build on GitHub before releasing, leave the publication checkbox clear and use the version currently declared on `main`. This stages the two candidates on GHCR under the commit SHA and tests them on a fresh runner. Version tags, Docker Hub and GitHub Releases are only updated by a publishing run.
 
 Keep GitHub release immutability enabled in the repository settings. Set the Actions variable `DOCKERHUB_USERNAME` and secret `DOCKERHUB_TOKEN` with push access to `metiva` and `metiva-service`. For an organization namespace, also set `DOCKERHUB_NAMESPACE`. The workflow uses its job token for GHCR and the GitHub Release.
 

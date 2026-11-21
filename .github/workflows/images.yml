@@ -1,13 +1,18 @@
 name: Release
-run-name: Release ${{ inputs.tag }} from ${{ github.sha }}
+run-name: ${{ inputs.publish && 'Publish' || 'Rehearse' }} ${{ inputs.tag }} from ${{ github.sha }}
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: New version prepared on main (vMAJOR.MINOR.PATCH)
+        description: Version in the checked-out packages (vMAJOR.MINOR.PATCH)
         required: true
         type: string
+      publish:
+        description: Promote to both registries and publish the GitHub release after the smoke test
+        required: true
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -48,14 +53,16 @@ jobs:
       - name: Check Verify on this exact main push and validate release inputs
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 tools/release_github.py check "$RELEASE_TAG"
+          MODE: ${{ inputs.publish && 'check' || 'rehearse' }}
+        run: python3 tools/release_github.py "$MODE" "$RELEASE_TAG"
       - name: Resolve registry repositories
         id: names
         env:
+          PUBLISH: ${{ inputs.publish }}
           HUB_LOGIN: ${{ vars.DOCKERHUB_USERNAME }}
           HUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || vars.DOCKERHUB_USERNAME }}
         run: |
-          if [[ -z "$HUB_LOGIN" || ! "$HUB_NAMESPACE" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+          if [[ "$PUBLISH" == true && ( -z "$HUB_LOGIN" || ! "$HUB_NAMESPACE" =~ ^[a-z0-9][a-z0-9_-]*$ ) ]]; then
             echo "::error::Configure DOCKERHUB_USERNAME and a valid Docker Hub namespace."
             exit 1
           fi
@@ -142,6 +149,7 @@ jobs:
   distribute:
     name: Promote tested digests and package offline assets
     needs: [gate, stage, smoke]
+    if: inputs.publish
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
