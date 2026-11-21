@@ -17,7 +17,7 @@ Download the production Compose file into a new directory on a Linux amd64 host.
 ```sh
 mkdir metiva && cd metiva
 curl --fail --location --output compose-prod.yaml \
-  https://github.com/ImJstNickDev/metiva/releases/download/v0.1.4/compose-prod.yaml
+  https://github.com/ImJstNickDev/metiva/releases/download/v0.1.5/compose-prod.yaml
 install -d -m 700 data
 install -d -m 755 data/artifacts
 printf 'METIVA_UID=%s\nMETIVA_GID=%s\n' "$(id -u)" "$(id -g)" > .env

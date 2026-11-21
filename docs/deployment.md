@@ -51,7 +51,7 @@ For registry deployment, set these variables in `.env` along with the public ori
 ```dotenv
 METIVA_INGRESS_IMAGE=ghcr.io/imjstnickdev/metiva
 METIVA_SERVICE_IMAGE=ghcr.io/imjstnickdev/metiva-service
-METIVA_IMAGE_TAG=v0.1.4
+METIVA_IMAGE_TAG=v0.1.5
 ```
 
 To pull from Docker Hub, set `METIVA_INGRESS_IMAGE=docker.io/imjstnick/metiva` and `METIVA_SERVICE_IMAGE=docker.io/imjstnick/metiva-service` with the same tag.
@@ -62,7 +62,7 @@ The v0.1.1 migration starts each cumulative library with its active v0.1.0 publi
 
 ### Pin images by digest
 
-Starting with the next release after v0.1.4, `image-digests.txt` in the release assets lists the two verified image digests on GHCR and Docker Hub. Its `METIVA_INGRESS_REF` and `METIVA_SERVICE_REF` assignments select the exact GHCR manifests. Copy both assignments into the deployment's `.env` next to the new `compose-prod.yaml`, then use the usual pull and start commands. These full references take precedence over repository and tag settings. Replace both pins together on each upgrade.
+Starting with v0.1.5, `image-digests.txt` in the release assets lists the two verified image digests on GHCR and Docker Hub. Its `METIVA_INGRESS_REF` and `METIVA_SERVICE_REF` assignments select the exact GHCR manifests. Copy both assignments into the deployment's `.env` next to the new `compose-prod.yaml`, then use the usual pull and start commands. These full references take precedence over repository and tag settings. Replace both pins together on each upgrade.
 
 ### Publishing a release
 
