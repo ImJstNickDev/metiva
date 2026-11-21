@@ -53,7 +53,7 @@ For registry deployment, set these variables in `.env` along with the public ori
 ```dotenv
 METIVA_INGRESS_IMAGE=ghcr.io/imjstnickdev/metiva
 METIVA_SERVICE_IMAGE=ghcr.io/imjstnickdev/metiva-service
-METIVA_IMAGE_TAG=v0.1.5
+METIVA_IMAGE_TAG=v0.1.6
 ```
 
 To pull from Docker Hub, set `METIVA_INGRESS_IMAGE=docker.io/imjstnick/metiva` and `METIVA_SERVICE_IMAGE=docker.io/imjstnick/metiva-service` with the same tag.
