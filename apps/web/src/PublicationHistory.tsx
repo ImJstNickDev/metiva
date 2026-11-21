@@ -21,9 +21,12 @@ export function PublicationHistory({
   const history = useInfiniteQuery({
     queryKey: [path],
     initialPageParam: null as number | null,
-    queryFn: ({ pageParam }) =>
+    queryFn: ({ pageParam, signal }) =>
       api<{ publications: Publication[]; next_before: number | null }>(
         path + (pageParam == null ? "" : "?before=" + pageParam),
+        "GET",
+        undefined,
+        signal,
       ),
     getNextPageParam: (page) => page.next_before ?? undefined,
   });

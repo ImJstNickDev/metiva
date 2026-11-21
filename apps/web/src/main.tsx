@@ -21,7 +21,8 @@ import {
 } from "lucide-react";
 import "@fontsource-variable/dm-sans/wght.css";
 import "./styles.css";
-import { api, cache, signedOut, useResource } from "./api";
+import { api, cache, signedOut, useDisconnected, useResource } from "./api";
+import { DashboardConnection } from "./DashboardConnection";
 import { Archive } from "./Archive";
 import { Auth } from "./Auth";
 import { Keys } from "./Keys";
@@ -343,6 +344,14 @@ function App() {
     }
   }, [theme]);
   const session = useResource<Session>("session", { refetchInterval: 60000 });
+  const disconnected = useDisconnected();
+  if (disconnected && !session.data) {
+    return (
+      <main className="offline-shell">
+        <Brand />
+      </main>
+    );
+  }
   return (
     <Data query={session}>
       {(s) =>
@@ -363,6 +372,7 @@ createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <QueryClientProvider client={cache}>
       <App />
+      <DashboardConnection />
     </QueryClientProvider>
   </StrictMode>,
 );

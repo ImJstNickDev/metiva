@@ -11,7 +11,7 @@ import {
   X,
 } from "lucide-react";
 import { useMutation } from "@tanstack/react-query";
-import { api, cache, useResource } from "./api";
+import { api, cache, isDisconnected, useDisconnected, useResource } from "./api";
 import {
   actions,
   bytes,
@@ -34,10 +34,12 @@ import {
 
 export function useStream() {
   const [connected, setConnected] = useState(false);
+  const disconnected = useDisconnected();
   useEffect(() => {
-    if (typeof EventSource === "undefined") return;
+    if (disconnected || typeof EventSource === "undefined") return;
     const stream = new EventSource("/api/admin/events");
     stream.addEventListener("transfers", (event) => {
+      if (isDisconnected()) return;
       try {
         const rows: unknown = JSON.parse(event.data);
         if (Array.isArray(rows)) {
@@ -49,10 +51,17 @@ export function useStream() {
       }
     });
     stream.onopen = () => setConnected(true);
-    stream.onerror = () => setConnected(false);
-    return () => stream.close();
-  }, []);
-  return connected;
+    stream.onerror = () => {
+      setConnected(false);
+      if (!isDisconnected())
+        void cache.invalidateQueries({ queryKey: ["session"] });
+    };
+    return () => {
+      stream.close();
+      setConnected(false);
+    };
+  }, [disconnected]);
+  return connected && !disconnected;
 }
 const icons = { pause: Pause, resume: Play, retry: RotateCcw, cancel: X };
 type Command = keyof typeof icons;
@@ -119,6 +128,7 @@ function History({ id }: { id: number }) {
 }
 export function Transfers() {
   const connected = useStream();
+  const disconnected = useDisconnected();
   const query = useResource<Transfer[]>("transfers", {
     refetchInterval: connected ? 30000 : 4000,
   });
@@ -146,7 +156,11 @@ export function Transfers() {
         actions={
           <span className={"connection " + (connected ? "online" : "")}>
             <Radio size={15} />
-            {connected ? "Live updates" : "Polling updates"}
+            {disconnected
+              ? "Updates paused"
+              : connected
+                ? "Live updates"
+                : "Polling updates"}
           </span>
         }
       />
