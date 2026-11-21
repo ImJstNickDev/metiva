@@ -175,7 +175,7 @@ function Workspace({
       content = <Projects route={route} />;
       break;
     case "transfers":
-      content = <Transfers />;
+      content = <Transfers statusSegment={route[1]} />;
       break;
     case "archive":
       content = <Archive />;

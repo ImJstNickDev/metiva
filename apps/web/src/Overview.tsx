@@ -17,6 +17,7 @@ import { useResource } from "./api";
 import {
   bytes,
   date,
+  transferStatusHref,
   type Activity,
   type Overview as Summary,
   type Project,
@@ -125,14 +126,14 @@ export function Overview() {
                     ArrowDownToLine,
                     "Active transfers",
                     o.active,
-                    "#transfers",
+                    transferStatusHref("active"),
                     "mint",
                   ],
                   [
                     ListOrdered,
                     "Queued transfers",
                     o.queued,
-                    "#transfers",
+                    transferStatusHref("queued"),
                     "blue",
                   ],
                 ] as const
