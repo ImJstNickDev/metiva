@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
-import { onlineManager } from "@tanstack/react-query";
+import { onlineManager, QueryClientProvider } from "@tanstack/react-query";
 import {
   api,
   cache,
@@ -9,8 +9,13 @@ import {
   ConnectionError,
   isDisconnected,
   recoverConnection,
+  useResource,
 } from "./api";
-import { DashboardConnection } from "./DashboardConnection";
+import {
+  DashboardConnection,
+  useDashboardLiveness,
+} from "./DashboardConnection";
+import type { Session } from "./model";
 import { Data } from "./ui";
 
 const session = {
@@ -20,6 +25,46 @@ const session = {
   csrfToken: "csrf",
 };
 const ok = (value: unknown) => new Response(JSON.stringify(value));
+
+function AuthenticatedView() {
+  useDashboardLiveness();
+  return <input aria-label="Draft" />;
+}
+
+function TestDashboard() {
+  const session = useResource<Session>("session");
+  return (
+    <>
+      {session.data?.authenticated ? <AuthenticatedView /> : <p>Sign in</p>}
+      <DashboardConnection />
+    </>
+  );
+}
+
+function openDashboard() {
+  vi.useFakeTimers();
+  const streams: FakeStream[] = [];
+  class FakeStream extends EventTarget {
+    close = vi.fn();
+    constructor(readonly url: string) {
+      super();
+      streams.push(this);
+    }
+  }
+  vi.stubGlobal("EventSource", FakeStream);
+  const request = vi.fn(async (_path: string, _options: RequestInit) =>
+    ok(session),
+  );
+  vi.stubGlobal("fetch", request);
+  cache.setQueryData(["session"], session);
+  render(
+    <QueryClientProvider client={cache}>
+      <TestDashboard />
+    </QueryClientProvider>,
+  );
+  expect(streams.map((s) => s.url)).toEqual(["/api/admin/lifecycle"]);
+  return { streams, stream: streams[0], request };
+}
 
 beforeAll(() => {
   HTMLDialogElement.prototype.showModal = function () {
@@ -39,6 +84,82 @@ afterEach(async () => {
   onlineManager.setOnline(true);
   cache.clear();
   vi.unstubAllGlobals();
+});
+
+it("pauses immediately on graceful stop and resumes the same view after revalidation", async () => {
+  const { stream, streams, request } = openDashboard();
+  const input = screen.getByRole<HTMLInputElement>("textbox", {
+    name: "Draft",
+  });
+  input.value = "unfinished";
+  act(() => stream.dispatchEvent(new Event("server-stopping")));
+  expect(
+    screen.getByRole("alertdialog", { name: /Reconnecting/ }),
+  ).toBeTruthy();
+  expect(stream.close).toHaveBeenCalledOnce();
+  expect(request).not.toHaveBeenCalled();
+  await expect(api("settings", "PATCH", {})).rejects.toBeInstanceOf(
+    ConnectionError,
+  );
+  await act(() => vi.advanceTimersByTimeAsync(1000));
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  expect(screen.getByLabelText("Draft")).toBe(input);
+  expect(input.value).toBe("unfinished");
+  expect(streams).toHaveLength(2);
+  expect(
+    request.mock.calls.map(([path, options]) => [path, options.method]),
+  ).toEqual([["/api/admin/session", "GET"]]);
+});
+
+it("detects a silent stream within eight seconds of its last heartbeat", async () => {
+  const { stream, request } = openDashboard();
+  for (let i = 0; i < 15; i++) {
+    await act(() => vi.advanceTimersByTimeAsync(2000));
+    act(() => stream.dispatchEvent(new Event("heartbeat")));
+  }
+  expect(request).not.toHaveBeenCalled();
+  // Opening or reconnecting a socket cannot substitute for a fresh heartbeat.
+  await act(() => vi.advanceTimersByTimeAsync(7999));
+  act(() => stream.dispatchEvent(new Event("open")));
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  await act(() => vi.advanceTimersByTimeAsync(1));
+  expect(screen.getByRole("alertdialog")).toBeTruthy();
+});
+
+it("revalidates stream renewal and expired sessions without showing an outage", async () => {
+  const { stream, request } = openDashboard();
+  act(() => stream.dispatchEvent(new Event("error")));
+  await act(() => vi.advanceTimersByTimeAsync(1000));
+  act(() => stream.dispatchEvent(new Event("heartbeat")));
+  expect(request).toHaveBeenCalledTimes(1);
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  cache.setQueryData(["settings"], { private: true });
+  request.mockImplementation(async () =>
+    ok({ authenticated: false, setupRequired: false }),
+  );
+  act(() => stream.dispatchEvent(new Event("error")));
+  await act(() => vi.advanceTimersByTimeAsync(1000));
+  expect(screen.getByText("Sign in")).toBeTruthy();
+  expect(stream.close).toHaveBeenCalledOnce();
+  expect(cache.getQueryData(["settings"])).toBeUndefined();
+  await act(() => vi.advanceTimersByTimeAsync(10000));
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+});
+
+it("checks promptly when a suspended dashboard becomes visible", async () => {
+  const { request } = openDashboard();
+  vi.setSystemTime(Date.now() + 60000);
+  request.mockImplementation(async () => new Response("", { status: 502 }));
+  await act(async () => {
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  expect(request).toHaveBeenCalled();
+  expect(screen.getByRole("alertdialog")).toBeTruthy();
+  request.mockImplementation(async () => ok(session));
+  await act(async () => {
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  expect(screen.queryByRole("alertdialog")).toBeNull();
 });
 
 it("keeps content mounted after a connection failure", () => {

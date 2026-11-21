@@ -160,13 +160,16 @@ def main():
         data.mkdir(mode=0o700)
         (data / "artifacts").mkdir(mode=0o755)
         try:
+            compose("up", "-d", "--pull", "never", "metiva")
+            assert compose("ps", "--services", "--status", "running", capture=True).split() == ["metiva"]
             compose("up", "-d", "--wait", "--wait-timeout", "120", "--pull", "never")
 
-            def read(path):
+            def url(path):
                 address = compose("port", "metiva", "80", capture=True).strip()
-                with urllib.request.urlopen(
-                    "http://" + address + path, timeout=10
-                ) as r:
+                return "http://" + address + path
+
+            def read(path):
+                with urllib.request.urlopen(url(path), timeout=10) as r:
                     return r.read()
 
             assert read("/healthz") == b""
@@ -178,6 +181,25 @@ def main():
             compose("up", "-d", "--wait", "--wait-timeout", "120", "--pull", "never")
             assert json.loads(read("/api/admin/session"))["setupRequired"]
             assert (data / "bootstrap-secret").read_bytes() == secret
+
+            setup = urllib.request.Request(
+                url("/api/admin/setup"),
+                data=json.dumps({
+                    "bootstrapSecret": secret.decode().strip(),
+                    "username": "operator",
+                    "password": secrets.token_urlsafe(24),
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(setup, timeout=10) as session:
+                cookie = session.headers["Set-Cookie"].split(";", 1)[0]
+            lifecycle = urllib.request.Request(
+                url("/api/admin/lifecycle"), headers={"Cookie": cookie}
+            )
+            with urllib.request.urlopen(lifecycle, timeout=10) as stream:
+                assert stream.readline() == b"event: heartbeat\n"
+                compose("down")
+                assert stream.read().endswith(b"event: server-stopping\ndata: {}\n\n")
         finally:
             compose("down", "--remove-orphans")
         print("Standalone Compose acceptance passed.")

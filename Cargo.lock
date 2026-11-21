@@ -1034,6 +1034,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower",
  "url",
  "zip",

@@ -14,12 +14,14 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
     pub data: PathBuf,
     pub public_url: String,
+    pub shutdown: CancellationToken,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +82,7 @@ pub async fn open(data: &Path, origin: &str) -> Result<AppState> {
         db,
         data: data.into(),
         public_url: url.origin().ascii_serialization(),
+        shutdown: CancellationToken::new(),
     })
 }
 

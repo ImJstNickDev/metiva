@@ -52,11 +52,7 @@ export function useStream() {
       }
     });
     stream.onopen = () => setConnected(true);
-    stream.onerror = () => {
-      setConnected(false);
-      if (!isDisconnected())
-        void cache.invalidateQueries({ queryKey: ["session"] });
-    };
+    stream.onerror = () => setConnected(false);
     return () => {
       stream.close();
       setConnected(false);
