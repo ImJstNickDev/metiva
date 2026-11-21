@@ -39,7 +39,7 @@ export function PublicationHistory({
         {(data) => {
           const entries = data.pages.flatMap((p) => p.publications);
           return entries.length ? (
-            <div className="form">
+            <div className="form publication-history">
               <Field label="Publication">
                 <select
                   value={selectedId ?? ""}
