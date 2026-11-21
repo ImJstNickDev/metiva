@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use metiva::{access, app, open, worker};
-use std::{env, fs::OpenOptions, path::PathBuf, time::Duration};
+use std::{env, fs::OpenOptions, future::IntoFuture, path::PathBuf, pin::pin, time::Duration};
 use tokio::signal::unix::{SignalKind, signal};
 
 async fn shutdown() {
@@ -59,9 +59,23 @@ async fn main() -> Result<()> {
             let address = env::var("METIVA_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
             let listener = tokio::net::TcpListener::bind(address).await?;
             eprintln!("Metiva API listening on {}", listener.local_addr()?);
-            axum::serve(listener, app(state))
-                .with_graceful_shutdown(shutdown())
-                .await?;
+            let stopping = state.shutdown.clone();
+            let mut server = pin!(
+                axum::serve(listener, app(state))
+                    .with_graceful_shutdown(stopping.clone().cancelled_owned())
+                    .into_future()
+            );
+            tokio::select! {
+                result = &mut server => result?,
+                () = shutdown() => {
+                    stopping.cancel();
+                    // Allow in-flight responses to finish within Compose's 30s stop grace period.
+                    match tokio::time::timeout(Duration::from_secs(25), server).await {
+                        Ok(result) => result?,
+                        Err(_) => eprintln!("API drain deadline reached"),
+                    }
+                }
+            }
         }
         "worker" => {
             let lock = OpenOptions::new()

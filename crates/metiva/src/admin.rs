@@ -13,7 +13,7 @@ use axum::{
     },
     routing::{get, patch, post},
 };
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{Column, Row, TypeInfo, ValueRef, sqlite::SqliteRow};
@@ -56,6 +56,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/admin/transfers/{id}", get(transfer_history))
         .route("/api/admin/transfers/{id}/{action}", post(control))
         .route("/api/admin/events", get(events))
+        .route("/api/admin/lifecycle", get(lifecycle))
         .merge(parking::router())
         .merge(timeline::router())
         .merge(worker::selection_router())
@@ -544,8 +545,33 @@ async fn control(State(s): State<AppState>, Path((id, action)): Path<(i64, Strin
     tx.commit().await?;
     Ok(Json(json!({"accepted":true})))
 }
+// Each renewal passes through the administrator session middleware. Between renewals
+// these events carry only process liveness and need no database or inventory reads.
+async fn lifecycle(State(s): State<AppState>) -> impl IntoResponse {
+    let expires = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut beats = tokio::time::interval(Duration::from_secs(2));
+    beats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let events = stream::unfold(Some((s.shutdown, beats)), move |state| async move {
+        let (stopping, mut beats) = state?;
+        tokio::select! {
+            biased;
+            () = stopping.cancelled() => {
+                let event = Event::default().event("server-stopping").data("{}");
+                Some((Ok::<_, Infallible>(event), None))
+            }
+            () = tokio::time::sleep_until(expires) => None,
+            _ = beats.tick() => {
+                let event = Event::default().event("heartbeat").data("{}").retry(Duration::from_secs(1));
+                Some((Ok(event), Some((stopping, beats))))
+            }
+        }
+    });
+    Sse::new(events)
+}
+
 async fn events(State(s): State<AppState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
     // Bound each connection lifetime so the browser periodically reauthenticates.
+    let stopping = s.shutdown.clone();
     let snapshots = stream::unfold(
         (s, headers, 0, String::new()),
         |(s, headers, n, last)| async move {
@@ -567,7 +593,7 @@ async fn events(State(s): State<AppState>, headers: axum::http::HeaderMap) -> im
             Some((Ok::<_, Infallible>(event), (s, headers, n + 1, fresh)))
         },
     );
-    Sse::new(snapshots).keep_alive(KeepAlive::default())
+    Sse::new(snapshots.take_until(stopping.cancelled_owned())).keep_alive(KeepAlive::default())
 }
 struct Usage {
     modified: SystemTime,

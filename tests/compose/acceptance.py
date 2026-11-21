@@ -740,3 +740,12 @@ elif sys.argv[1] == "restart":
     wait(healthy, "deployment failed to recover")
     assert len(request(published, key=state["key"])["releases"][0]["artifacts"]) == 3
     assert admin("archive")
+    # Exercise both Nginx hops with the external proxy's default response buffering.
+    conn = http.client.HTTPSConnection("mirror.test", context=tls, timeout=8)
+    try:
+        conn.request("GET", "/api/admin/lifecycle", headers={"Cookie": state["cookie"]})
+        response = conn.getresponse()
+        assert response.status == 200
+        assert response.readline() == b"event: heartbeat\n"
+    finally:
+        conn.close()
