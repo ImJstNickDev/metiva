@@ -32,3 +32,11 @@ cargo test --locked --workspace
 ```
 
 Run `python3 tests/compose/run.py` for changes to the worker, publication, file authorization or deployment. Use the pull request description to record the tested behavior and link the issue. Schema changes belong in new numbered migrations.
+
+## Branches and releases
+
+Start each change on a short-lived branch from `main`. Keep each PR independently reviewable and reversible. Split unrelated changes even when they share a milestone. Link the issues the PR closes and describe how you verified the changed behavior. Keep follow-up work in an issue.
+
+Squash a completed PR after the required Rust, dashboard and deployment checks pass. GitHub removes its head branch after merge. Use an annotated `vX.Y.Z` tag on the tested main commit for each release. A maintenance branch makes sense when two release lines need fixes at the same time.
+
+Follow the [release procedure](docs/deployment.md#publishing-a-release) to publish images and attach the verified deployment files.
