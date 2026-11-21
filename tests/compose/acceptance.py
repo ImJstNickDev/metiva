@@ -75,6 +75,48 @@ def manifest(names, broken=False):
     return doc
 
 
+def wiki_first_download():
+    """Exercise the public guide's example against an actual published file."""
+    project = admin("projects", "POST", {
+        "name": "Toolkit", "slug": "toolkit", "description": "Portable tools", "visibility": "public"
+    })
+    runtime = admin(f"projects/{project['id']}/runtimes", "POST", {
+        "name": "Portable", "slug": "portable"
+    })
+    payload = b"hello\n"
+    (ROOT / "bundle.bin").write_bytes(payload)
+    source = {"releases": [{"version": "winter-01", "artifacts": [
+        {"filename": "bundle.bin", "url": ORIGIN + "/bundle.bin"}
+    ]}]}
+    admin(f"runtimes/{runtime['id']}/sources", "POST", {"upload": json.dumps(source)})
+    sync(runtime=runtime["id"])
+
+    assert request("/docs/", raw=True) != request("/", raw=True)
+    spec = request("/api/v1/openapi.json")
+    operations = {item["get"]["operationId"]: (path, item) for path, item in spec["paths"].items()}
+
+    def example_request(operation):
+        path, item = operations[operation]
+        for param in item["parameters"]:
+            if param["in"] == "path":
+                path = path.replace("{" + param["name"] + "}", param["example"])
+        return request(path)
+
+    assert any(p["slug"] == "toolkit" for p in example_request("listProjects"))
+    assert [r["slug"] for r in example_request("listRuntimes")] == ["portable"]
+    assert example_request("getAvailability")["available"]
+    catalog = example_request("getManifest")
+    assert catalog["releases"] == example_request("listReleases")
+    files = example_request("listArtifacts")
+    assert catalog["releases"][0]["artifacts"] == files
+    artifact, = files
+    expected = operations["listArtifacts"][1]["get"]["responses"]["200"]["content"]["application/json"]["example"][0]
+    assert artifact["url"] == expected["url"].replace("https://mirror.example.org", "https://mirror.test")
+    assert artifact["size"] == expected["size"] == len(payload)
+    data = request(artifact["url"].removeprefix("https://mirror.test"), raw=True)
+    assert data == payload and hashlib.sha256(data).hexdigest() == artifact["sha256"] == expected["sha256"]
+
+
 def wait(check, msg, timeout=100):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -740,3 +782,4 @@ elif sys.argv[1] == "restart":
     wait(healthy, "deployment failed to recover")
     assert len(request(published, key=state["key"])["releases"][0]["artifacts"]) == 3
     assert admin("archive")
+    wiki_first_download()
