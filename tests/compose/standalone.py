@@ -1,27 +1,60 @@
 """Start the production Compose file from an empty working directory."""
 
+import argparse
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import subprocess
-import sys
 import tempfile
 import urllib.request
 
 
+def ghcr_digest_ref(value):
+    if not re.fullmatch(
+        r"ghcr\.io/[a-z0-9._-]+/[a-z0-9._/-]+@sha256:[a-f0-9]{64}", value
+    ):
+        raise argparse.ArgumentTypeError(
+            "expected a GHCR image reference pinned by SHA-256 digest"
+        )
+    return value
+
+
 def main():
-    source = Path(
-        os.environ.get(
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--compose-file",
+        type=Path,
+        default=os.environ.get(
             "METIVA_TEST_COMPOSE_FILE",
             Path(__file__).resolve().parents[2] / "compose-prod.yaml",
-        )
+        ),
+        help="production Compose file to test",
     )
+    parser.add_argument(
+        "--pull", action="store_true", help="pull the published Compose images"
+    )
+    parser.add_argument(
+        "--ingress-image", type=ghcr_digest_ref, help="staged ingress image digest reference"
+    )
+    parser.add_argument(
+        "--service-image", type=ghcr_digest_ref, help="staged API and worker image digest reference"
+    )
+    args = parser.parse_args()
+    if bool(args.ingress_image) != bool(args.service_image):
+        parser.error("--ingress-image and --service-image must be provided together")
+
+    local_images = {
+        "METIVA_IMAGE_TAG": "local",
+        "METIVA_INGRESS_IMAGE": "metiva-ingress",
+        "METIVA_SERVICE_IMAGE": "metiva-service",
+    }
     with tempfile.TemporaryDirectory(prefix="metiva-standalone-") as tmp:
         root = Path(tmp)
-        file = root / source.name
-        shutil.copyfile(source, file)
+        file = root / args.compose_file.name
+        shutil.copyfile(args.compose_file, file)
         command = [
             "docker",
             "compose",
@@ -36,10 +69,14 @@ def main():
             "METIVA_GID": str(os.getgid()),
         }
         for key in [
+            "COMPOSE_ENV_FILES",
             "METIVA_PUBLIC_URL",
             "METIVA_DATA_DIR",
             "METIVA_PORT",
             "METIVA_BIND_ADDRESS",
+            "METIVA_INGRESS_REF",
+            "METIVA_SERVICE_REF",
+            *local_images,
         ]:
             env.pop(key, None)
 
@@ -71,8 +108,6 @@ def main():
         )
         assert all(v["type"] == "bind" for s in services.values() for v in s["volumes"])
         assert services["metiva"]["volumes"][0]["read_only"]
-        if "--pull" in sys.argv:
-            assert all(s["image"].endswith(":v0.1.4") for s in services.values())
 
         # Bind a random loopback port, leaving every production port and network untouched.
         env.update(
@@ -82,13 +117,33 @@ def main():
         )
         if subnet := os.environ.get("METIVA_TEST_SUBNET"):
             env["METIVA_SUBNET"] = subnet
-        if "--pull" in sys.argv:
-            compose("pull")
-        else:
+        if args.ingress_image:
+            env.update(
+                METIVA_INGRESS_REF=args.ingress_image,
+                METIVA_SERVICE_REF=args.service_image,
+            )
+            staged_config = json.loads(
+                compose("config", "--format", "json", capture=True)
+            )
+            selected_images = {
+                name: service["image"] for name, service in staged_config["services"].items()
+            }
+            expected_images = {
+                "metiva": args.ingress_image,
+                "metiva-api": args.service_image,
+                "metiva-worker": args.service_image,
+            }
+            if selected_images != expected_images:
+                raise RuntimeError(
+                    f"Compose did not select the staged images: {selected_images}"
+                )
+        elif not args.pull:
             # The PR build runs before release images exist.
-            env.setdefault("METIVA_IMAGE_TAG", "local")
-            env.setdefault("METIVA_INGRESS_IMAGE", "metiva-ingress")
-            env.setdefault("METIVA_SERVICE_IMAGE", "metiva-service")
+            env.update(
+                {key: os.environ.get(key, default) for key, default in local_images.items()}
+            )
+        if args.pull or args.ingress_image:
+            compose("pull")
         data = root / "data"
         data.mkdir(mode=0o700)
         (data / "artifacts").mkdir(mode=0o755)
