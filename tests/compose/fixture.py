@@ -44,6 +44,7 @@ class Origin(BaseHTTPRequestHandler):
             "/stall.bin": "stall.bin",
             "/alpha.bin": "alpha.bin",
             "/beta.bin": "beta.bin",
+            "/bundle.bin": "bundle.bin",
             "/gamma.bin": "gamma.bin",
         }.get(self.path)
         if history := re.fullmatch(r"/history/(\d{4})\.(json|bin)", self.path):

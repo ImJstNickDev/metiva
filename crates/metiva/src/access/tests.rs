@@ -549,6 +549,7 @@ async fn contract_matches_routes_and_only_active_files_are_public() {
         .request(Method::GET, "/api/v1/openapi.json", &[], None)
         .await;
     assert_eq!(spec.status, 200);
+    let mut operation_ids = std::collections::HashSet::new();
     for (route, op) in spec.body["paths"].as_object().unwrap() {
         let path = route
             .replace("{project}", "pub")
@@ -565,7 +566,25 @@ async fn contract_matches_routes_and_only_active_files_are_public() {
             200,
             "{path}"
         );
-        assert!(op["get"]["responses"]["200"].is_object());
+        for method in ["get", "head"] {
+            let operation = &op[method];
+            let id = operation["operationId"].as_str().unwrap();
+            assert!(
+                !id.is_empty() && operation_ids.insert(id),
+                "{method} {route}"
+            );
+            assert!(operation["tags"][0].is_string());
+            assert!(operation["responses"]["200"].is_object());
+        }
+        assert!(op["head"]["responses"]["200"].get("content").is_none());
+        for segment in route.split('/').filter(|s| s.starts_with('{')) {
+            let params = op["parameters"].as_array().unwrap();
+            assert!(
+                params.iter().any(
+                    |p| p["name"] == segment[1..segment.len() - 1] && p["example"].is_string()
+                )
+            );
+        }
     }
     sqlx::raw_sql("INSERT INTO publications(id,runtime_id,manifest) VALUES(6,1,'{\"schema_version\":1,\"project\":\"pub\",\"runtime\":\"stable\",\"releases\":[]}'); UPDATE runtimes SET active_publication=6 WHERE id=1;")
         .execute(&f.state.db).await.unwrap();
