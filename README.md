@@ -46,7 +46,7 @@ curl --fail --header "Authorization: Bearer ${METIVA_KEY}" \
   "${METIVA_PUBLIC_URL}/p/atlas/r/linux/manifest.json"
 ```
 
-The consumer contract is available from your instance at `/api/v1/openapi.json`. See [API and manifest formats](docs/api.md) for a sample source, mapping and authorization rules.
+Open **API reference** in the dashboard or visit `/docs/` on your mirror for download guides and endpoint documentation. The machine-readable contract is at `/api/v1/openapi.json`. See [API and manifest formats](docs/api.md) for a sample source, mapping and authorization rules.
 
 ## Operate and develop
 

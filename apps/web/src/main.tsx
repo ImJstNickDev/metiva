@@ -22,6 +22,7 @@ import {
 import "@fontsource-variable/dm-sans/wght.css";
 import "./styles.css";
 import { api, cache, signedOut, useDisconnected, useResource } from "./api";
+import { useTheme } from "./theme";
 import { DashboardConnection } from "./DashboardConnection";
 import { Archive } from "./Archive";
 import { Auth } from "./Auth";
@@ -247,7 +248,7 @@ function Workspace({
             </div>
             <div className="top-actions">
               <a
-                href="/api/v1/openapi.json"
+                href="/docs/"
                 className="doc-link"
                 target="_blank"
                 rel="noreferrer"
@@ -329,23 +330,7 @@ function Workspace({
   );
 }
 function App() {
-  const [theme, setTheme] = useState(() => {
-    try {
-      return localStorage.getItem("metiva-theme") === "light"
-        ? "light"
-        : "dark";
-    } catch {
-      return "dark";
-    }
-  });
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    try {
-      localStorage.setItem("metiva-theme", theme);
-    } catch {
-      /* Theme remains available for this visit. */
-    }
-  }, [theme]);
+  const [theme, toggleTheme] = useTheme();
   const session = useResource<Session>("session", { refetchInterval: 60000 });
   const disconnected = useDisconnected();
   if (disconnected && !session.data) {
@@ -362,7 +347,7 @@ function App() {
           <Workspace
             session={s}
             theme={theme}
-            toggle={() => setTheme(theme === "dark" ? "light" : "dark")}
+            toggle={toggleTheme}
           />
         ) : (
           <Auth setup={s.setupRequired} />

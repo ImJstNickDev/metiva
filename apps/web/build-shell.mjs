@@ -6,6 +6,7 @@ import { readdir, readFile, writeFile } from "node:fs/promises";
 const files = (await readdir("dist", { recursive: true, withFileTypes: true }))
   .filter((entry) => entry.isFile())
   .map((entry) => (entry.parentPath + "/" + entry.name).replace(/^dist\//, "/"))
+  .filter((file) => !file.startsWith("/docs/") && !file.startsWith("/assets/docs-"))
   .sort();
 const version = createHash("sha256");
 for (const file of files)

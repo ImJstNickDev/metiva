@@ -1,6 +1,6 @@
 # Consumer API
 
-Fetch `GET /api/v1/openapi.json` from the running service for the machine-readable contract. Dashboard requests use a separate session and CSRF token under `/api/admin/`.
+Visit `/docs/` on your mirror for the first-download guide and per-operation reference. Fetch `GET /api/v1/openapi.json` from the running service for the machine-readable contract. Dashboard requests use a separate session and CSRF token under `/api/admin/`.
 
 | Request | Result |
 | --- | --- |
