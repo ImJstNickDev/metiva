@@ -913,6 +913,13 @@ dialog::backdrop {
 .form > p {
   font-size: 0.875rem;
 }
+.publication-history {
+  grid-template-columns: minmax(0, 1fr);
+}
+.publication-history pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .field {
   display: grid;
   gap: 0.38rem;
