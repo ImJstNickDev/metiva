@@ -56,12 +56,17 @@ Run `docker compose -f compose-prod.yaml pull` followed by `docker compose -f co
 
 The v0.1.1 migration starts each cumulative library with its active v0.1.0 publication. Earlier copies of a current file appear in its timeline. Open **Sync history → Publication history** for a previous manifest and its original source documents. Files that were already administrator-only remain accessible under **Publication → Past files**.
 
-### Publishing images as a maintainer
+### Pin images by digest
 
-A published GitHub release builds the ingress and service images on GHCR. To also publish on Docker Hub, configure the repository Actions variable `DOCKERHUB_USERNAME` and the Actions secret `DOCKERHUB_TOKEN` with write access to both public repositories, `metiva` and `metiva-service`. For an organization, set `DOCKERHUB_NAMESPACE` to its Docker Hub name. The workflow copies the released manifests and checks their digests against GHCR.
+Starting with the next release after v0.1.4, `image-digests.txt` in the release assets lists the two verified image digests on GHCR and Docker Hub. Its `METIVA_INGRESS_REF` and `METIVA_SERVICE_REF` assignments select the exact GHCR manifests. Copy both assignments into the deployment's `.env` next to the new `compose-prod.yaml`, then use the usual pull and start commands. These full references take precedence over repository and tag settings. Replace both pins together on each upgrade.
 
-To copy an already published tag after enabling Docker Hub, use the **Versioned images** workflow on the default branch.
+### Publishing a release
 
-```sh
-gh workflow run images.yml -f tag=v0.1.4
-```
+1. Merge the intended changes into `main` through pull requests. Prepare the package versions, production Compose defaults and the matching `## vX.Y.Z` section in `CHANGELOG.md` in a release preparation PR. That section supplies the public release notes.
+2. On GitHub, run **Actions → Release → Run workflow** on `main`, with the new version as the tag. The CLI equivalent is `gh workflow run images.yml --ref main -f tag=vX.Y.Z` with the prepared version. GitHub fixes the commit at dispatch time.
+3. The workflow waits for the successful `Verify` run on that exact push to `main`. It builds the two Linux amd64 candidates on GHCR, records their digests and starts and recreates all three services using those digests and the release's standalone Compose file.
+4. It copies the tested digests to the version tags on GHCR and Docker Hub, checks all four references, and prepares the offline Docker archive, Compose file, image pins and SHA-256 checksums. The final job checks GitHub's stored asset digests, creates the annotated Git tag and publishes the draft. Versions in the 0.x series are marked as development pre-releases.
+
+Keep GitHub release immutability enabled in the repository settings. Set the Actions variable `DOCKERHUB_USERNAME` and secret `DOCKERHUB_TOKEN` with push access to `metiva` and `metiva-service`. For an organization namespace, also set `DOCKERHUB_NAMESPACE`. The workflow uses its job token for GHCR and the GitHub Release.
+
+If a job fails, inspect its log and rerun the failed jobs on the original commit. The workflow reuses staged images, checks existing version tags against the tested digests, and resumes its draft. A conflicting version tag stops promotion. Corrections to a published release get a new version number.
