@@ -24,6 +24,8 @@ Restore into an empty local data directory at the configured path with the same 
 
 Back up the deployment. For a standalone install, replace the production Compose file with the one from the desired release, run `docker compose -f compose-prod.yaml pull`, then `docker compose -f compose-prod.yaml up -d --wait`. Keep your existing data directory, origin and ownership settings. For source builds, check out the desired release and run `docker compose up -d --build`. The API applies embedded, ordered schema migrations before reporting healthy. To roll back an incompatible migration, restore both the matching backup and the previous release.
 
+When upgrading from v0.1.4 or earlier with an explicit `METIVA_SUBNET`, stop the deployment with `docker compose -f compose-prod.yaml down` **before** replacing the old Compose file. This frees the CIDR for the new network. The bind-mounted data directory persists across this operation. Deployments using automatic subnet allocation can follow the normal upgrade procedure.
+
 ## Administrator recovery
 
 From a standalone deployment directory, run

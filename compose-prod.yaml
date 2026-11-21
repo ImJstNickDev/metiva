@@ -1,5 +1,7 @@
 x-service: &service
   image: ${METIVA_SERVICE_REF:-${METIVA_SERVICE_IMAGE:-ghcr.io/imjstnickdev/metiva-service}:${METIVA_IMAGE_TAG:-v0.1.4}}
+  networks: &mirror-networks
+    - default${METIVA_SUBNET:+-static}
   user: "${METIVA_UID:-1000}:${METIVA_GID:-1000}"
   environment:
     METIVA_PUBLIC_URL: ${METIVA_PUBLIC_URL:-http://localhost:${METIVA_PORT:-8088}}
@@ -43,6 +45,7 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    networks: *mirror-networks
     ports:
       - "${METIVA_BIND_ADDRESS:-0.0.0.0}:${METIVA_PORT:-8088}:80"
     volumes:
@@ -57,7 +60,8 @@ services:
       timeout: 4s
 
 networks:
-  default:
+  default: {}
+  default-static:
     ipam:
       config:
         - subnet: ${METIVA_SUBNET:-}

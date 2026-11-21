@@ -74,6 +74,7 @@ def main():
             "METIVA_DATA_DIR",
             "METIVA_PORT",
             "METIVA_BIND_ADDRESS",
+            "METIVA_SUBNET",
             "METIVA_INGRESS_REF",
             "METIVA_SERVICE_REF",
             *local_images,
@@ -97,6 +98,9 @@ def main():
         assert not any(n.get("external") for n in config["networks"].values())
         assert not any(n.get("internal") for n in config["networks"].values())
         assert set(config["networks"]) == {"default"}
+        assert not config["networks"]["default"].get("ipam", {}).get("config"), (
+            "Docker must allocate the default subnet without an explicit CIDR"
+        )
         assert not services["metiva-api"].get("ports") and not services[
             "metiva-worker"
         ].get("ports")
@@ -115,8 +119,16 @@ def main():
             METIVA_PORT="0",
             METIVA_PUBLIC_URL="http://localhost:8088",
         )
-        if subnet := os.environ.get("METIVA_TEST_SUBNET"):
-            env["METIVA_SUBNET"] = subnet
+        # Render the opt-in subnet on every run. Use Docker's normal allocation
+        # for the live deployment unless the local fixture needs a specific CIDR.
+        subnet = os.environ.get("METIVA_TEST_SUBNET", "10.244.91.0/28")
+        env["METIVA_SUBNET"] = subnet
+        explicit = json.loads(compose("config", "--format", "json", capture=True))
+        (network,) = explicit["networks"]
+        assert explicit["networks"][network]["ipam"]["config"][0]["subnet"] == subnet
+        assert all(set(s["networks"]) == {network} for s in explicit["services"].values())
+        if not os.environ.get("METIVA_TEST_SUBNET"):
+            del env["METIVA_SUBNET"]
         if args.ingress_image:
             env.update(
                 METIVA_INGRESS_REF=args.ingress_image,
