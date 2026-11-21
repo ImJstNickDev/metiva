@@ -8,6 +8,7 @@ it("precaches public shell files without credentials and bypasses private reques
   const handlers = new Map();
   const storage = { addAll: vi.fn(), match: vi.fn(async (file) => file) };
   const open = vi.fn(async () => storage);
+  const network = vi.fn();
   runInNewContext(
     readFileSync(new URL("../dashboard-worker.js", import.meta.url), "utf8"),
     {
@@ -20,6 +21,8 @@ it("precaches public shell files without credentials and bypasses private reques
       shellFiles,
       shellCache: "metiva-dashboard-test",
       URL,
+      AbortSignal,
+      fetch: network,
       Request: class extends Request {
         constructor(path, options) {
           super(new URL(path, origin), options);
@@ -43,6 +46,12 @@ it("precaches public shell files without credentials and bypasses private reques
     });
     return respondWith.mock.calls[0]?.[0];
   };
+  const fresh = new Response("latest shell");
+  network.mockResolvedValueOnce(fresh);
+  expect(await fetchEvent("/")).toBe(fresh);
+  network.mockResolvedValueOnce(new Response("Bad gateway", { status: 502 }));
+  expect(await fetchEvent("/")).toBe("/index.html");
+  network.mockRejectedValueOnce(new TypeError("Failed to fetch"));
   expect(await fetchEvent("/")).toBe("/index.html");
   expect(await fetchEvent("/assets/dashboard.js")).toBe("/assets/dashboard.js");
   for (const path of [

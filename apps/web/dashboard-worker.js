@@ -52,7 +52,22 @@ self.addEventListener("fetch", (event) => {
   event.respondWith(
     (async () => {
       const cache = await caches.open(shellCache);
-      return (await cache.match(file)) || fetch(request);
+      const cached = await cache.match(file);
+      if (!cached) return fetch(request);
+      if (file === "/index.html" && request.mode === "navigate") {
+        // A reachable ingress may serve a newer build or a rollback. Only
+        // use the installed shell when the navigation cannot reach it.
+        try {
+          const response = await fetch(request, {
+            cache: "no-store",
+            signal: AbortSignal.timeout(4000),
+          });
+          if (response.status < 500) return response;
+        } catch {
+          // Offline, or the ingress did not respond in time.
+        }
+      }
+      return cached;
     })(),
   );
 });
