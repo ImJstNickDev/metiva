@@ -106,6 +106,37 @@ async fn reply(response: Response) -> (StatusCode, Value) {
     (parts.status, value)
 }
 
+#[tokio::test]
+async fn lifecycle_authenticates_then_sends_heartbeats_and_one_final_event_to_each_client() {
+    let d = Dashboard::new().await;
+    let request = Request::get("/api/admin/lifecycle")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(d.app.clone().oneshot(request).await.unwrap().status(), 401);
+
+    let mut clients = Vec::new();
+    for _ in 0..2 {
+        let response = d.raw(Method::GET, "lifecycle", None).await;
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        clients.push(response.into_body().into_data_stream());
+    }
+    // Established lifecycle streams run independently of the database and its transfer inventory.
+    d.state.db.close().await;
+    for client in &mut clients {
+        let event = client.next().await.unwrap().unwrap();
+        assert_eq!(event, "event: heartbeat\ndata: {}\nretry: 1000\n\n");
+    }
+    d.state.shutdown.cancel();
+    for client in &mut clients {
+        assert_eq!(
+            client.next().await.unwrap().unwrap(),
+            "event: server-stopping\ndata: {}\n\n"
+        );
+        assert!(client.next().await.is_none());
+    }
+}
+
 fn upload(version: &str) -> Value {
     json!({"upload":json!({"entries":[{"tag":version,"files":[{"name":"kit.bin","href":"https://downloads.example.org/kit.bin"}]}]}).to_string(),
         "mapping":{"releases_path":"entries","version_path":"tag"}})

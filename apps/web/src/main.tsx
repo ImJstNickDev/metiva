@@ -23,7 +23,10 @@ import "@fontsource-variable/dm-sans/wght.css";
 import "./styles.css";
 import { api, cache, signedOut, useDisconnected, useResource } from "./api";
 import { useTheme } from "./theme";
-import { DashboardConnection } from "./DashboardConnection";
+import {
+  DashboardConnection,
+  useDashboardLiveness,
+} from "./DashboardConnection";
 import { Archive } from "./Archive";
 import { Auth } from "./Auth";
 import { BackToTop } from "./BackToTop";
@@ -132,6 +135,7 @@ function Workspace({
   theme: string;
   toggle: () => void;
 }) {
+  useDashboardLiveness();
   const route = useRoute(),
     section = route[0] || "overview",
     title = links.find((x) => x[0] === section)?.[1] || "Page unavailable";

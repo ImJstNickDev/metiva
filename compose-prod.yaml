@@ -20,6 +20,10 @@ services:
   metiva-api:
     <<: *service
     command: ["api"]
+    # Nginx resolves the API at request time. Keep it running until API streams drain.
+    depends_on:
+      metiva:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
       interval: 15s
@@ -50,9 +54,6 @@ services:
       - "${METIVA_BIND_ADDRESS:-0.0.0.0}:${METIVA_PORT:-8088}:80"
     volumes:
       - ${METIVA_DATA_DIR:-./data}/artifacts:/srv/objects:ro
-    depends_on:
-      metiva-api:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1/healthz"]
       interval: 15s

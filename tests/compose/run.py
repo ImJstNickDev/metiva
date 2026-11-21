@@ -91,7 +91,7 @@ def main():
         (
             tls / "default.conf"
         ).write_text("""server { listen 443 ssl; ssl_certificate /tls/cert;
-ssl_certificate_key /tls/key; location / {proxy_pass http://metiva:80; proxy_buffering off; proxy_http_version 1.1;} }
+ssl_certificate_key /tls/key; location / {proxy_pass http://metiva:80; proxy_http_version 1.1;} }
 """)
         services["fixture"] = {
             "image": "python:3.12-slim",
