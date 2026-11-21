@@ -1,0 +1,26 @@
+.back-to-top {
+  --bottom-offset: max(1.2rem, env(safe-area-inset-bottom, 0px));
+  position: fixed;
+  right: max(1.1rem, env(safe-area-inset-right, 0px));
+  bottom: var(--bottom-offset);
+  z-index: 4;
+  min-height: 44px;
+  box-shadow: 0 4px 16px #0003;
+  animation: back-to-top-in 180ms ease-out;
+}
+
+.back-to-top ~ .toast {
+  bottom: calc(max(1.2rem, env(safe-area-inset-bottom, 0px)) + 3.35rem);
+}
+
+@keyframes back-to-top-in {
+  from {
+    transform: translateY(calc(100% + var(--bottom-offset)));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .back-to-top {
+    animation: none;
+  }
+}

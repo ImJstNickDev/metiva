@@ -19,6 +19,7 @@ import {
   display,
   eta,
   percent,
+  transferStatusHref,
   type Transfer,
 } from "./model";
 import {
@@ -65,6 +66,25 @@ export function useStream() {
 }
 const icons = { pause: Pause, resume: Play, retry: RotateCcw, cancel: X };
 type Command = keyof typeof icons;
+// Match the states counted as active by the Overview API.
+const activeStates = ["connecting", "downloading", "verifying"];
+const statusOptions = [
+  "active",
+  "queued",
+  ...activeStates,
+  "paused",
+  "retrying",
+  "failed",
+  "cancelled",
+  "completed",
+];
+function readStatus(segment: string) {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return "";
+  }
+}
 function Progress({ t }: { t: Transfer }) {
   const p = percent(t);
   return (
@@ -126,14 +146,15 @@ function History({ id }: { id: number }) {
     </Data>
   );
 }
-export function Transfers() {
+export function Transfers({ statusSegment = "" }: { statusSegment?: string }) {
+  const status = readStatus(statusSegment);
+  const states = status === "active" ? activeStates : [status];
   const connected = useStream();
   const disconnected = useDisconnected();
   const query = useResource<Transfer[]>("transfers", {
     refetchInterval: connected ? 30000 : 4000,
   });
   const [search, setSearch] = useState(""),
-    [state, setState] = useState(""),
     [project, setProject] = useState(""),
     [engine, setEngine] = useState(""),
     [expanded, setExpanded] = useState<number | null>(null),
@@ -167,9 +188,12 @@ export function Transfers() {
       <Panel title="Transfer queue" icon={ArrowDownToLine}>
         <Data query={query}>
           {(rows) => {
+            const statuses = [
+              ...new Set([...statusOptions, ...rows.map((t) => t.state), status]),
+            ].filter(Boolean);
             const items = rows.filter(
               (t) =>
-                (!state || t.state === state) &&
+                (!status || states.includes(t.state)) &&
                 (!project || t.project === project) &&
                 (!engine || t.backend === engine) &&
                 [t.filename, t.host, t.runtime]
@@ -195,22 +219,11 @@ export function Transfers() {
                       [
                         [
                           "status",
-                          state,
-                          setState,
-                          Array.from(
-                            new Set([
-                              ...rows.map((t) => t.state),
-                              "queued",
-                              "connecting",
-                              "downloading",
-                              "verifying",
-                              "paused",
-                              "retrying",
-                              "failed",
-                              "cancelled",
-                              "completed",
-                            ]),
-                          ),
+                          status,
+                          (value: string) => {
+                            location.hash = transferStatusHref(value);
+                          },
+                          statuses,
                         ],
                         [
                           "project",
