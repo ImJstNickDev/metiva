@@ -14,10 +14,13 @@ export function FileHistory({
   const history = useInfiniteQuery({
     queryKey: ["file-history", file.id],
     initialPageParam: null as number | null,
-    queryFn: ({ pageParam }) =>
+    queryFn: ({ pageParam, signal }) =>
       api<{ revisions: Revision[]; next_before: number | null }>(
         `files/${file.id}/history` +
           (pageParam == null ? "" : "?before=" + pageParam),
+        "GET",
+        undefined,
+        signal,
       ),
     getNextPageParam: (page) => page.next_before ?? undefined,
   });
@@ -90,13 +93,16 @@ export function PastFiles({
   const files = useInfiniteQuery({
     queryKey: ["past-files", runtimeId],
     initialPageParam: null as number | null,
-    queryFn: ({ pageParam }) =>
+    queryFn: ({ pageParam, signal }) =>
       api<{
         files: (ArchiveFile & { created_at: number })[];
         next_before: number | null;
       }>(
         `runtimes/${runtimeId}/past-files` +
           (pageParam == null ? "" : "?before=" + pageParam),
+        "GET",
+        undefined,
+        signal,
       ),
     getNextPageParam: (page) => page.next_before ?? undefined,
   });

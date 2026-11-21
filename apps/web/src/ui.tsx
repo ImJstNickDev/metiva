@@ -21,6 +21,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
+import { ConnectionError } from "./api";
 import { display } from "./model";
 
 export const NoticeContext = createContext<(message: string) => void>(() => {});
@@ -161,7 +162,8 @@ export function Data<T>({
   };
   children: (data: T) => ReactNode;
 }) {
-  if (query.error)
+  if (query.error instanceof ConnectionError && query.data === undefined) return null;
+  if (query.error && !(query.error instanceof ConnectionError))
     return (
       <div className="query-error">
         <Problem error={query.error} />
