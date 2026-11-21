@@ -6,6 +6,8 @@ Download `compose-prod.yaml` from the release assets and follow the [quick start
 
 Local administration at `http://localhost:8088` uses the browser's localhost exception for secure cookies. For remote administration use an HTTPS reverse proxy and set `METIVA_PUBLIC_URL` to the exact origin shown in the browser. A reverse proxy on the same host can connect to a loopback-only binding. A proxy on another host or bridge needs a reachable host address. Set `METIVA_PORT` and `METIVA_BIND_ADDRESS` in `.env` to match your routing.
 
+During an outage an open dashboard keeps its last snapshot in memory and pauses actions until it can validate the session and refresh the page. After a previous visit over HTTPS or localhost, browsers with service workers can also reload the dashboard shell while the stack is down. A reload clears the private snapshot. The offline cache contains only static dashboard files.
+
 ## Storage and process ownership
 
 Set `METIVA_DATA_DIR` to a local filesystem on the Docker host. The directory holds the database, its WAL and shared-memory files, the object store, temporary downloads and the initial bootstrap secret. Keep staging and artifacts on one filesystem for atomic promotion. Keep the parent private to the deployment account. Allow the ingress worker to read completed objects and traverse its read-only `artifacts` mount.

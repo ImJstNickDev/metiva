@@ -376,3 +376,9 @@ createRoot(document.getElementById("root")!).render(
     </QueryClientProvider>
   </StrictMode>,
 );
+
+if (import.meta.env.PROD && "serviceWorker" in navigator) {
+  void navigator.serviceWorker.register("/dashboard-worker.js").catch(() => {
+    // The dashboard still works online when browser storage is unavailable.
+  });
+}
