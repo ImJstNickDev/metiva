@@ -21,7 +21,10 @@ type Parameter = {
 };
 type ResponseSpec = {
   description: string;
-  headers?: Record<string, { schema: Schema; description?: string; example?: unknown }>;
+  headers?: Record<
+    string,
+    { schema: Schema; description?: string; example?: unknown }
+  >;
   content?: Record<string, { schema: Schema; example?: unknown }>;
 };
 type OperationSpec = {
@@ -36,7 +39,10 @@ type OperationSpec = {
 export type Contract = {
   info: { title: string; version: string; description?: string };
   tags?: { name: string; description?: string }[];
-  paths: Record<string, { parameters?: Parameter[]; get?: OperationSpec; head?: OperationSpec }>;
+  paths: Record<
+    string,
+    { parameters?: Parameter[]; get?: OperationSpec; head?: OperationSpec }
+  >;
   security?: Security;
   components: { schemas: Record<string, Schema> };
 };
@@ -51,16 +57,27 @@ export function operations(spec: Contract): Operation[] {
     (["get", "head"] as const).flatMap((verb) => {
       const op = item[verb];
       if (!op) return [];
-      const params = new Map((item.parameters ?? []).map((p) => [p.in + "/" + p.name, p]));
+      const params = new Map(
+        (item.parameters ?? []).map((p) => [p.in + "/" + p.name, p]),
+      );
       for (const p of op.parameters ?? []) params.set(p.in + "/" + p.name, p);
-      return [{ ...op, path, method: verb === "get" ? "GET" as const : "HEAD" as const,
-        parameters: [...params.values()], security: op.security ?? spec.security ?? [] }];
-    })
+      return [
+        {
+          ...op,
+          path,
+          method: verb === "get" ? ("GET" as const) : ("HEAD" as const),
+          parameters: [...params.values()],
+          security: op.security ?? spec.security ?? [],
+        },
+      ];
+    }),
   );
 }
 export function resolveSchema(schema: Schema, spec: Contract): Schema {
   return schema.$ref?.startsWith("#/components/schemas/")
-    ? spec.components.schemas[schema.$ref.slice("#/components/schemas/".length)] ?? schema
+    ? (spec.components.schemas[
+        schema.$ref.slice("#/components/schemas/".length)
+      ] ?? schema)
     : schema;
 }
 export function schemaType(schema: Schema): string {
@@ -72,9 +89,16 @@ export function schemaType(schema: Schema): string {
 export function requestExample(op: Operation, origin: string) {
   const path = op.path.replace(/\{([^}]+)\}/g, (_, name: string) => {
     const param = op.parameters.find((p) => p.in === "path" && p.name === name);
-    return encodeURIComponent(String(param?.example ?? param?.schema.example ?? name));
+    return encodeURIComponent(
+      String(param?.example ?? param?.schema.example ?? name),
+    );
   });
-  const option = op.method === "HEAD" ? " --head" : op.responses["200"]?.content?.["application/octet-stream"] ? " --output artifact.bin" : "";
-  return 'curl --fail' + option + ' \\\n  "' + origin + path + '"';
+  const option =
+    op.method === "HEAD"
+      ? " --head"
+      : op.responses["200"]?.content?.["application/octet-stream"]
+        ? " --output artifact.bin"
+        : "";
+  return "curl --fail" + option + ' \\\n  "' + origin + path + '"';
 }
 export const referenceLink = (id: string) => "#/reference/" + id;

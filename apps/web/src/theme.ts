@@ -18,5 +18,8 @@ export function useTheme() {
       /* Theme remains available for this visit. */
     }
   }, [theme]);
-  return [theme, () => setTheme((current) => current === "dark" ? "light" : "dark")] as const;
+  return [
+    theme,
+    () => setTheme((current) => (current === "dark" ? "light" : "dark")),
+  ] as const;
 }
