@@ -1,4 +1,4 @@
-import { StrictMode, useEffect, useState, type ReactNode } from "react";
+import { StrictMode, useEffect, useRef, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClientProvider, useMutation } from "@tanstack/react-query";
 import {
@@ -24,6 +24,7 @@ import "./styles.css";
 import { api, cache, signedOut, useResource } from "./api";
 import { Archive } from "./Archive";
 import { Auth } from "./Auth";
+import { BackToTop } from "./BackToTop";
 import { Keys } from "./Keys";
 import { Overview } from "./Overview";
 import { Projects } from "./Projects";
@@ -135,6 +136,7 @@ function Workspace({
   const [drawer, setDrawer] = useState(false),
     [toast, setToast] = useState(""),
     [logout, setLogout] = useState(false);
+  const main = useRef<HTMLElement>(null);
   const settings = useResource<Configuration>("settings");
   const project = useResource<Project>("projects/" + route[1], {
     enabled: section === "projects" && !!route[1],
@@ -205,11 +207,12 @@ function Workspace({
         className="skip"
         onClick={(e) => {
           e.preventDefault();
-          document.getElementById("main-content")?.focus();
+          main.current?.focus();
         }}
       >
         Skip to content
       </a>
+      <BackToTop key={route.join("/")} target={main} />
       <div className="shell">
         <aside className="sidebar">{side}</aside>
         <div className="workspace">
@@ -270,7 +273,7 @@ function Workspace({
               </button>
             </div>
           </header>
-          <main id="main-content" tabIndex={-1} className="content">
+          <main id="main-content" tabIndex={-1} className="content" ref={main}>
             {content}
           </main>
         </div>
