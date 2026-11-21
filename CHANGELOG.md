@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.6
+
+- Open **API reference** in the dashboard or visit `/docs/` for a first-download guide and links to each consumer API operation. The reference reads the OpenAPI document served by your installation.
+- Idle dashboard pages now detect a lost connection. An orderly shutdown announces itself before the API closes its connections. A lightweight heartbeat covers crashes and silent network interruptions. The dashboard checks the session and refreshes data when service returns.
+
 ## v0.1.5
 
 - Keep the last dashboard view visible through an outage. Metiva pauses actions, checks the session and refreshes data when the server returns. A previously loaded dashboard can reopen its reconnecting screen during downtime. Private API responses stay out of the offline cache.
